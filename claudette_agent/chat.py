@@ -1,14 +1,21 @@
 """
 Chat module - Chat and AsyncChat classes with conversation history.
+
+This module provides a Claudette-compatible API using the Claude Agent SDK.
+Key differences from Claudette:
+- Tools require MCP server registration (handled automatically)
+- Streaming returns complete message blocks, not text chunks
+- Uses ClaudeSDKClient for tool support, query() for simple prompts
 """
 import asyncio
 import uuid
-from typing import Any, Dict, List, Optional, Union, Callable
+import inspect
+from typing import Any, Dict, List, Optional, Union, Callable, get_type_hints
 
 from .core import (
     Usage, usage, Message, TextBlock, ToolUseBlock,
     contents, mk_msg, mk_msgs, mk_toolres, mk_toolres_async,
-    get_schema, mk_tool_choice, listify, mk_ns, tool, get_costs,
+    get_schema, mk_tool_choice, listify, mk_ns, get_costs,
     model_types, pricing, DEFAULT_MODEL
 )
 from .client import Client, AsyncClient
@@ -17,7 +24,11 @@ try:
     from claude_agent_sdk import (
         ClaudeSDKClient,
         ClaudeAgentOptions,
+        query as sdk_query,
+        tool as sdk_tool,
+        create_sdk_mcp_server,
         AssistantMessage as SDKAssistantMessage,
+        TextBlock as SDKTextBlock,
     )
     SDK_AVAILABLE = True
 except ImportError:
@@ -37,18 +48,87 @@ def nested_idx(lst: List, *indices) -> Any:
     return result
 
 
+def _convert_to_sdk_tool(func: Callable) -> Any:
+    """
+    Convert a regular Python function to an SDK tool.
+
+    The SDK expects tools in a specific format created by @tool decorator.
+    """
+    if not SDK_AVAILABLE:
+        raise ImportError("claude-agent-sdk is required")
+
+    # Get function metadata
+    name = func.__name__
+    doc = inspect.getdoc(func) or f"Function {name}"
+    description = doc.split("\n")[0]  # First line of docstring
+
+    # Build parameter schema from type hints
+    hints = get_type_hints(func) if hasattr(func, '__annotations__') else {}
+    sig = inspect.signature(func)
+
+    params = {}
+    for param_name, param in sig.parameters.items():
+        if param_name in ('self', 'cls'):
+            continue
+        param_type = hints.get(param_name, str)
+        # Map Python types to simple types for SDK
+        if param_type == int:
+            params[param_name] = int
+        elif param_type == float:
+            params[param_name] = float
+        elif param_type == bool:
+            params[param_name] = bool
+        else:
+            params[param_name] = str
+
+    # Create the SDK tool wrapper
+    @sdk_tool(name, description, params)
+    async def sdk_wrapper(args):
+        # Call the original function with the args
+        try:
+            if asyncio.iscoroutinefunction(func):
+                result = await func(**args)
+            else:
+                result = func(**args)
+            return {
+                "content": [{"type": "text", "text": str(result)}]
+            }
+        except Exception as e:
+            return {
+                "content": [{"type": "text", "text": f"Error: {str(e)}"}],
+                "is_error": True
+            }
+
+    # Store reference to original function
+    sdk_wrapper._original_func = func
+    sdk_wrapper._tool_name = name
+
+    return sdk_wrapper
+
+
 class Chat:
     """
     Claude chat client with conversation history.
 
     Maintains a conversation history and supports tools, system prompts,
-    and streaming responses.
+    and message streaming.
+
+    IMPORTANT: When using tools, the Chat class uses ClaudeSDKClient which
+    requires tools to be packaged as MCP servers. This is handled automatically.
 
     Example:
-        >>> chat = Chat('claude-sonnet-4-5-20250929', sp="You are a helpful assistant")
+        >>> chat = Chat(model='claude-sonnet-4-5-20250929', sp="You are a helpful assistant")
         >>> response = await chat("Hello!")
         >>> print(contents(response))
         >>> response = await chat("What did I just say?")  # Remembers context
+
+    With tools:
+        >>> @tool
+        ... def add(a: int, b: int) -> int:
+        ...     '''Add two numbers'''
+        ...     return a + b
+        >>> chat = Chat(model='claude-sonnet-4-5-20250929', tools=[add])
+        >>> response = await chat("What is 2 + 3?")
     """
 
     def __init__(
@@ -103,21 +183,51 @@ class Chat:
         if hist is None:
             hist = []
 
-        if tools:
-            tools = [tool(t) for t in listify(tools)]
-
-        if ns is None:
-            ns = tools
-
         self.h = hist  # Conversation history
         self.sp = sp  # System prompt
-        self.tools = tools
         self.cont_pr = cont_pr
         self.temp = temp
         self.cache = cache
-        self.ns = ns
         self.last: List[Dict] = []  # Last response messages
-        self._sdk_client: Optional[ClaudeSDKClient] = None
+
+        # Process tools - convert to SDK format and create MCP server
+        self._original_tools = listify(tools) if tools else []
+        self._sdk_tools = []
+        self._mcp_server = None
+        self._allowed_tools = allowed_tools or []
+
+        if self._original_tools:
+            self._setup_tools()
+
+        # Create namespace for tool results
+        if ns is None:
+            ns = {t.__name__: t for t in self._original_tools} if self._original_tools else {}
+        self.ns = ns
+
+    def _setup_tools(self):
+        """Set up tools as an MCP server for the SDK."""
+        # Convert each tool to SDK format
+        for func in self._original_tools:
+            if callable(func):
+                sdk_t = _convert_to_sdk_tool(func)
+                self._sdk_tools.append(sdk_t)
+                # Add to allowed tools list
+                tool_name = f"mcp__tools__{func.__name__}"
+                if tool_name not in self._allowed_tools:
+                    self._allowed_tools.append(tool_name)
+
+        # Create MCP server with all tools
+        if self._sdk_tools:
+            self._mcp_server = create_sdk_mcp_server(
+                name="tools",
+                version="1.0.0",
+                tools=self._sdk_tools
+            )
+
+    @property
+    def tools(self):
+        """Get the original tools list."""
+        return self._original_tools
 
     @property
     def use(self) -> Usage:
@@ -147,79 +257,29 @@ class Chat:
     def _append_pr(self, pr: Any = None) -> None:
         """Append prompt to history, handling role alternation."""
         prev_role = nested_idx(self.h, -1, 'role') if self.h else 'assistant'
-
-        if pr and prev_role == 'user':
-            # Already have a user request pending, run it first
-            asyncio.get_event_loop().run_until_complete(self._call_impl())
-
         self._post_pr(pr, prev_role)
 
-    async def _call_impl(
-        self,
-        temp: Optional[float] = None,
-        maxtok: int = 4096,
-        maxthinktok: int = 0,
-        stream: bool = False,
-        prefill: str = '',
-        tool_choice: Optional[Union[str, bool, Dict]] = None,
-        **kw
-    ) -> Message:
-        """Internal implementation of the call."""
-        if temp is None:
-            temp = self.temp
+    def _build_options(self, **kwargs) -> 'ClaudeAgentOptions':
+        """Build ClaudeAgentOptions for the SDK call."""
+        opts = {
+            'system_prompt': self.sp or "You are a helpful assistant.",
+        }
 
-        # Build the full conversation context
-        conversation_text = self._build_conversation_prompt()
-
-        # Build options
-        options = ClaudeAgentOptions(
-            system_prompt=self.sp or "You are a helpful assistant.",
-            max_turns=kw.get('max_turns', 1),
-        )
+        if kwargs.get('max_turns'):
+            opts['max_turns'] = kwargs['max_turns']
 
         if self.c.cwd:
-            options.cwd = self.c.cwd
+            opts['cwd'] = self.c.cwd
 
-        if self.c._mcp_servers:
-            options.mcp_servers = self.c._mcp_servers
+        # Add MCP server if we have tools
+        if self._mcp_server:
+            opts['mcp_servers'] = {"tools": self._mcp_server}
 
-        # Make the SDK call
-        from claude_agent_sdk import query as sdk_query
+        # Add allowed tools
+        if self._allowed_tools:
+            opts['allowed_tools'] = self._allowed_tools
 
-        collected_text = []
-        final_message = None
-
-        try:
-            async for msg in sdk_query(prompt=conversation_text, options=options):
-                if hasattr(msg, 'content'):
-                    final_message = self._parse_sdk_message(msg)
-                    for block in msg.content:
-                        if hasattr(block, 'text'):
-                            collected_text.append(block.text)
-        except Exception as e:
-            final_message = Message(
-                id=str(uuid.uuid4()),
-                role='assistant',
-                content=[TextBlock(text=f"Error: {str(e)}")],
-                usage=usage()
-            )
-
-        if final_message is None:
-            final_message = Message(
-                id=str(uuid.uuid4()),
-                role='assistant',
-                content=[TextBlock(text="".join(collected_text) if collected_text else "No response")],
-                usage=usage()
-            )
-
-        # Update client state
-        self.c._r(final_message, prefill)
-
-        # Create tool results and update history
-        self.last = mk_toolres(final_message, ns=self.ns)
-        self.h.extend(self.last)
-
-        return final_message
+        return ClaudeAgentOptions(**opts)
 
     def _build_conversation_prompt(self) -> str:
         """Build a conversation prompt from history."""
@@ -285,6 +345,118 @@ class Chat:
             usage=msg_usage
         )
 
+    async def _call_with_tools(
+        self,
+        conversation_text: str,
+        options: 'ClaudeAgentOptions',
+        **kwargs
+    ) -> Message:
+        """Make a call using ClaudeSDKClient (required for tools)."""
+        collected_text = []
+        final_message = None
+
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(conversation_text)
+
+                async for msg in client.receive_response():
+                    if hasattr(msg, 'content'):
+                        final_message = self._parse_sdk_message(msg)
+                        for block in msg.content:
+                            if hasattr(block, 'text'):
+                                collected_text.append(block.text)
+                    # Handle result message for cost tracking
+                    if hasattr(msg, 'total_cost_usd'):
+                        pass  # Could track costs here
+
+        except Exception as e:
+            final_message = Message(
+                id=str(uuid.uuid4()),
+                role='assistant',
+                content=[TextBlock(text=f"Error: {str(e)}")],
+                usage=usage()
+            )
+
+        if final_message is None:
+            final_message = Message(
+                id=str(uuid.uuid4()),
+                role='assistant',
+                content=[TextBlock(text="".join(collected_text) if collected_text else "No response")],
+                usage=usage()
+            )
+
+        return final_message
+
+    async def _call_simple(
+        self,
+        conversation_text: str,
+        options: 'ClaudeAgentOptions',
+        **kwargs
+    ) -> Message:
+        """Make a simple call using query() (no tools)."""
+        collected_text = []
+        final_message = None
+
+        try:
+            async for msg in sdk_query(prompt=conversation_text, options=options):
+                if hasattr(msg, 'content'):
+                    final_message = self._parse_sdk_message(msg)
+                    for block in msg.content:
+                        if hasattr(block, 'text'):
+                            collected_text.append(block.text)
+        except Exception as e:
+            final_message = Message(
+                id=str(uuid.uuid4()),
+                role='assistant',
+                content=[TextBlock(text=f"Error: {str(e)}")],
+                usage=usage()
+            )
+
+        if final_message is None:
+            final_message = Message(
+                id=str(uuid.uuid4()),
+                role='assistant',
+                content=[TextBlock(text="".join(collected_text) if collected_text else "No response")],
+                usage=usage()
+            )
+
+        return final_message
+
+    async def _call_impl(
+        self,
+        temp: Optional[float] = None,
+        maxtok: int = 4096,
+        maxthinktok: int = 0,
+        stream: bool = False,
+        prefill: str = '',
+        tool_choice: Optional[Union[str, bool, Dict]] = None,
+        **kw
+    ) -> Message:
+        """Internal implementation of the call."""
+        if temp is None:
+            temp = self.temp
+
+        # Build the full conversation context
+        conversation_text = self._build_conversation_prompt()
+
+        # Build options
+        options = self._build_options(**kw)
+
+        # Use ClaudeSDKClient if we have tools, otherwise use query()
+        if self._mcp_server:
+            final_message = await self._call_with_tools(conversation_text, options, **kw)
+        else:
+            final_message = await self._call_simple(conversation_text, options, **kw)
+
+        # Update client state
+        self.c._r(final_message, prefill)
+
+        # Create tool results and update history
+        self.last = mk_toolres(final_message, ns=self.ns)
+        self.h.extend(self.last)
+
+        return final_message
+
     async def __call__(
         self,
         pr: Any = None,
@@ -304,7 +476,7 @@ class Chat:
             temp: Temperature
             maxtok: Maximum tokens
             maxthinktok: Maximum thinking tokens
-            stream: Stream response?
+            stream: Stream response? (Note: SDK streams messages, not text chunks)
             prefill: Optional prefill to pass to Claude as start of its response
             tool_choice: Optionally force use of some tool
 
@@ -314,7 +486,7 @@ class Chat:
         if temp is None:
             temp = self.temp
 
-        # Handle history append (sync part)
+        # Handle history append
         prev_role = nested_idx(self.h, -1, 'role') if self.h else 'assistant'
         if pr and prev_role == 'user':
             # Already have a user request pending, run it first
@@ -343,6 +515,10 @@ class Chat:
         """
         Add prompt and get response, automatically following up with tool_use messages.
 
+        Note: With the Claude Agent SDK, tool execution is handled automatically
+        by ClaudeSDKClient. This method provides compatibility with Claudette's API
+        but the SDK manages the tool loop internally.
+
         Args:
             pr: Prompt to pass to Claude
             max_steps: Maximum number of tool requests to loop through
@@ -360,12 +536,18 @@ class Chat:
         results = []
         init_n = len(self.h)
 
+        # With SDK, the tool loop is handled internally
+        # We set max_turns to allow multiple tool calls
+        kwargs['max_turns'] = max_steps
+
         r = await self(pr, **kwargs)
         results.append(r)
 
         if len(self.last) > 1:
             results.append(self.last[1])
 
+        # The SDK handles additional tool calls internally
+        # But we can still check for tool_use stop reason for compatibility
         for i in range(max_steps - 1):
             if self.c.stop_reason != 'tool_use':
                 break
@@ -390,7 +572,11 @@ class Chat:
         **kwargs
     ):
         """
-        Stream a response from Claude.
+        Get a response from Claude, yielding message blocks as they arrive.
+
+        IMPORTANT: The Claude Agent SDK streams complete message blocks, not
+        individual text characters like the Anthropic API. Each yield is a
+        complete text block from a message.
 
         Args:
             pr: Prompt / message
@@ -399,14 +585,12 @@ class Chat:
             **kwargs: Additional options
 
         Yields:
-            Text chunks as they arrive
+            Text content from each message block as it arrives
 
         Example:
-            >>> async for chunk in chat.stream("Tell me a story"):
-            ...     print(chunk, end="", flush=True)
+            >>> async for text in chat.stream("Tell me a story"):
+            ...     print(text)  # Each 'text' is a complete message block
         """
-        from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
-
         if temp is None:
             temp = self.temp
 
@@ -417,19 +601,27 @@ class Chat:
         conversation_text = self._build_conversation_prompt()
 
         # Build options
-        options = ClaudeAgentOptions(
-            system_prompt=self.sp or "You are a helpful assistant.",
-            max_turns=kwargs.get('max_turns', 1),
-        )
+        options = self._build_options(**kwargs)
 
         collected_text = []
 
-        async for msg in sdk_query(prompt=conversation_text, options=options):
-            if hasattr(msg, 'content'):
-                for block in msg.content:
-                    if hasattr(block, 'text'):
-                        collected_text.append(block.text)
-                        yield block.text
+        # Use appropriate method based on whether we have tools
+        if self._mcp_server:
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(conversation_text)
+                async for msg in client.receive_response():
+                    if hasattr(msg, 'content'):
+                        for block in msg.content:
+                            if hasattr(block, 'text'):
+                                collected_text.append(block.text)
+                                yield block.text
+        else:
+            async for msg in sdk_query(prompt=conversation_text, options=options):
+                if hasattr(msg, 'content'):
+                    for block in msg.content:
+                        if hasattr(block, 'text'):
+                            collected_text.append(block.text)
+                            yield block.text
 
         # Update history with the full response
         full_response = "".join(collected_text)
@@ -550,6 +742,9 @@ class AsyncChat(Chat):
         """
         results = []
         init_n = len(self.h)
+
+        # With SDK, set max_turns for tool handling
+        kwargs['max_turns'] = max_steps
 
         r = await self(pr, **kwargs)
         results.append(r)

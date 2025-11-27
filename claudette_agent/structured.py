@@ -1,5 +1,8 @@
 """
 Structured outputs module - Pydantic model support for Claude responses.
+
+This module uses the Claude Agent SDK's output_format feature with JSON schemas
+to get validated structured outputs from Claude.
 """
 import re
 import json
@@ -12,6 +15,12 @@ try:
 except ImportError:
     PYDANTIC_AVAILABLE = False
     BaseModel = object
+
+try:
+    from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
+    SDK_AVAILABLE = True
+except ImportError:
+    SDK_AVAILABLE = False
 
 from .core import (
     Message, TextBlock, ToolUseBlock, contents, mk_msg, mk_tool_choice,
@@ -188,7 +197,7 @@ def add_struct_to_chat(chat_cls):
     """
     Add structured output support to a Chat class.
 
-    This is a decorator that adds the `struct` method.
+    Uses the Claude Agent SDK's output_format feature for validated JSON output.
     """
     async def struct(
         self,
@@ -198,7 +207,7 @@ def add_struct_to_chat(chat_cls):
         **kwargs
     ) -> T:
         """
-        Parse Claude output into a Pydantic model.
+        Parse Claude output into a Pydantic model using SDK's output_format.
 
         Args:
             pr: Prompt to send (required)
@@ -214,35 +223,58 @@ def add_struct_to_chat(chat_cls):
         if not PYDANTIC_AVAILABLE:
             raise ImportError("pydantic is required for structured outputs")
 
-        # Append prompt
+        if not SDK_AVAILABLE:
+            raise ImportError("claude-agent-sdk is required for structured outputs")
+
+        # Append prompt to history
         self._append_pr(pr)
 
-        # Build tool choice
-        kwargs["tool_choice"] = mk_tool_choice(resp_model.__name__)
-        kwargs["tools"] = [claude_schema(resp_model)]
+        # Build the conversation context
+        conversation_text = self._build_conversation_prompt()
 
-        # Make the call
-        response = await self._call_impl(**kwargs)
+        # Get JSON schema from Pydantic model
+        json_schema = resp_model.model_json_schema()
 
-        # Extract and parse result
-        inp = _extract_tool_input(response)
-        result = _mk_struct(inp, resp_model)
+        # Build options with output_format
+        opts = {
+            'system_prompt': self.sp or "You are a helpful assistant.",
+            'output_format': {
+                'type': 'json_schema',
+                'schema': json_schema
+            }
+        }
+
+        if kwargs.get('max_turns'):
+            opts['max_turns'] = kwargs['max_turns']
+
+        if self.c.cwd:
+            opts['cwd'] = self.c.cwd
+
+        options = ClaudeAgentOptions(**opts)
+
+        # Make the call and look for structured_output
+        result_data = None
+
+        async for msg in sdk_query(prompt=conversation_text, options=options):
+            # Check for structured_output attribute
+            if hasattr(msg, 'structured_output') and msg.structured_output:
+                result_data = msg.structured_output
+            # Also check for result message type
+            elif hasattr(msg, 'type') and msg.type == 'result':
+                if hasattr(msg, 'structured_output') and msg.structured_output:
+                    result_data = msg.structured_output
+
+        if result_data is None:
+            raise ValueError("No structured output received from Claude")
+
+        # Validate with Pydantic
+        result = resp_model.model_validate(result_data)
 
         # Update history
         if treat_as_output:
             msgs = [mk_msg(repr(result), "assistant")]
         else:
-            # Include the tool use in history
-            tool_block = find_block(response, ToolUseBlock)
-            tool_id = getattr(tool_block, 'id', '') if tool_block else ''
-            msgs = [
-                mk_msg(response.model_dump(), "assistant"),
-                mk_msg([{
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": repr(result)
-                }], "user")
-            ]
+            msgs = [mk_msg(json.dumps(result_data), "assistant")]
 
         self.h.extend(msgs)
         return result

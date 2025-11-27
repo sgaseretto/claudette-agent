@@ -143,6 +143,8 @@ asyncio.run(main())
 
 ### Streaming Responses
 
+**Note:** The Claude Agent SDK streams complete message blocks, not individual text characters like the Anthropic API. Each yielded value is a complete text block.
+
 ```python
 import asyncio
 from claudette_agent import Chat
@@ -150,8 +152,9 @@ from claudette_agent import Chat
 async def main():
     chat = Chat(model="claude-sonnet-4-5-20250929")
 
-    async for chunk in chat.stream("Tell me a story about a brave knight"):
-        print(chunk, end="", flush=True)
+    # Each 'block' is a complete text block from the SDK, not a character stream
+    async for block in chat.stream("Tell me a story about a brave knight"):
+        print(block, end="", flush=True)
 
     print()  # Final newline
 
@@ -253,8 +256,10 @@ This package provides the same API as Claudette, but uses the Claude Agent SDK i
 |---------|-----------|-----------------|
 | API | Anthropic SDK | Claude Agent SDK |
 | Auth | API Key | Claude Code subscription |
-| Tools | Function calling | MCP + Function calling |
+| Tools | Function calling | MCP servers (automatic) |
 | Sessions | Manual | SDK-managed |
+| Streaming | Text chunks | Message blocks |
+| Structured | Tool forcing | JSON schema output_format |
 
 ### Migration from Claudette
 
@@ -274,6 +279,7 @@ Most code should work with minor changes:
 2. **Model parameter**: Pass `model="claude-sonnet-4-5-20250929"` to `Chat()`
 3. **struct signature**: Use `chat.struct(prompt, ModelClass)` (prompt first)
 4. **MCP support**: Additional MCP server integration features
+5. **Streaming**: SDK streams message blocks, not text chunks (less granular but still works)
 
 ## License
 
