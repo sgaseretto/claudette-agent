@@ -375,7 +375,6 @@ class Chat:
         """Make a call using ClaudeSDKClient (required for tools)."""
         collected_text = []
         final_message = None
-        processed_ids = set()  # Track message IDs to avoid double-counting usage
         total_usage = usage()
 
         try:
@@ -383,27 +382,22 @@ class Chat:
                 await client.query(conversation_text)
 
                 async for msg in client.receive_response():
-                    # Check for ResultMessage which has total_cost_usd (per SDK docs)
+                    # Check for ResultMessage which has usage and total_cost_usd
                     if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
+                        # Extract usage from ResultMessage (this is where usage actually is!)
+                        if hasattr(msg, 'usage') and msg.usage:
+                            total_usage = _parse_usage(msg.usage)
                         if hasattr(msg, 'total_cost_usd'):
                             self.c._last_cost_usd = msg.total_cost_usd
                         continue
 
-                    # Process AssistantMessage for content and usage (per SDK docs)
+                    # Process AssistantMessage for content only (usage is on ResultMessage)
                     if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
                         if hasattr(msg, 'content'):
                             final_message = self._parse_sdk_message(msg)
                             for block in msg.content:
                                 if hasattr(block, 'text'):
                                     collected_text.append(block.text)
-
-                        # Track usage - deduplicate by message ID (per SDK docs)
-                        if hasattr(msg, 'usage') and msg.usage:
-                            msg_id = getattr(msg, 'id', None)
-                            if msg_id and msg_id not in processed_ids:
-                                processed_ids.add(msg_id)
-                                msg_usage = _parse_usage(msg.usage)
-                                total_usage = total_usage + msg_usage
                     elif hasattr(msg, 'content'):
                         # Fallback for other message types
                         final_message = self._parse_sdk_message(msg)
@@ -442,32 +436,26 @@ class Chat:
         """Make a simple call using query() (no tools)."""
         collected_text = []
         final_message = None
-        processed_ids = set()  # Track message IDs to avoid double-counting usage
         total_usage = usage()
 
         try:
             async for msg in sdk_query(prompt=conversation_text, options=options):
-                # Check for ResultMessage which has total_cost_usd (per SDK docs)
+                # Check for ResultMessage which has usage and total_cost_usd
                 if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
+                    # Extract usage from ResultMessage (this is where usage actually is!)
+                    if hasattr(msg, 'usage') and msg.usage:
+                        total_usage = _parse_usage(msg.usage)
                     if hasattr(msg, 'total_cost_usd'):
                         self.c._last_cost_usd = msg.total_cost_usd
                     continue
 
-                # Process AssistantMessage for content and usage (per SDK docs)
+                # Process AssistantMessage for content only (usage is on ResultMessage)
                 if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
                     if hasattr(msg, 'content'):
                         final_message = self._parse_sdk_message(msg)
                         for block in msg.content:
                             if hasattr(block, 'text'):
                                 collected_text.append(block.text)
-
-                    # Track usage - deduplicate by message ID (per SDK docs)
-                    if hasattr(msg, 'usage') and msg.usage:
-                        msg_id = getattr(msg, 'id', None)
-                        if msg_id and msg_id not in processed_ids:
-                            processed_ids.add(msg_id)
-                            msg_usage = _parse_usage(msg.usage)
-                            total_usage = total_usage + msg_usage
                 elif hasattr(msg, 'content'):
                     # Fallback for other message types
                     final_message = self._parse_sdk_message(msg)
@@ -679,7 +667,6 @@ class Chat:
         options = self._build_options(**kwargs)
 
         collected_text = []
-        processed_ids = set()  # Track message IDs to avoid double-counting usage
         total_usage = usage()
 
         # Use appropriate method based on whether we have tools
@@ -687,27 +674,22 @@ class Chat:
             async with ClaudeSDKClient(options=options) as client:
                 await client.query(conversation_text)
                 async for msg in client.receive_response():
-                    # Check for ResultMessage (per SDK docs)
+                    # Check for ResultMessage which has usage and total_cost_usd
                     if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
+                        # Extract usage from ResultMessage (this is where usage actually is!)
+                        if hasattr(msg, 'usage') and msg.usage:
+                            total_usage = _parse_usage(msg.usage)
                         if hasattr(msg, 'total_cost_usd'):
                             self.c._last_cost_usd = msg.total_cost_usd
                         continue
 
-                    # Process AssistantMessage (per SDK docs)
+                    # Process AssistantMessage for content only (usage is on ResultMessage)
                     if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
                         if hasattr(msg, 'content'):
                             for block in msg.content:
                                 if hasattr(block, 'text'):
                                     collected_text.append(block.text)
                                     yield block.text
-
-                        # Track usage
-                        if hasattr(msg, 'usage') and msg.usage:
-                            msg_id = getattr(msg, 'id', None)
-                            if msg_id and msg_id not in processed_ids:
-                                processed_ids.add(msg_id)
-                                msg_usage = _parse_usage(msg.usage)
-                                total_usage = total_usage + msg_usage
                     elif hasattr(msg, 'content'):
                         for block in msg.content:
                             if hasattr(block, 'text'):
@@ -715,27 +697,22 @@ class Chat:
                                 yield block.text
         else:
             async for msg in sdk_query(prompt=conversation_text, options=options):
-                # Check for ResultMessage (per SDK docs)
+                # Check for ResultMessage which has usage and total_cost_usd
                 if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
+                    # Extract usage from ResultMessage (this is where usage actually is!)
+                    if hasattr(msg, 'usage') and msg.usage:
+                        total_usage = _parse_usage(msg.usage)
                     if hasattr(msg, 'total_cost_usd'):
                         self.c._last_cost_usd = msg.total_cost_usd
                     continue
 
-                # Process AssistantMessage (per SDK docs)
+                # Process AssistantMessage for content only (usage is on ResultMessage)
                 if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
                     if hasattr(msg, 'content'):
                         for block in msg.content:
                             if hasattr(block, 'text'):
                                 collected_text.append(block.text)
                                 yield block.text
-
-                    # Track usage
-                    if hasattr(msg, 'usage') and msg.usage:
-                        msg_id = getattr(msg, 'id', None)
-                        if msg_id and msg_id not in processed_ids:
-                            processed_ids.add(msg_id)
-                            msg_usage = _parse_usage(msg.usage)
-                            total_usage = total_usage + msg_usage
                 elif hasattr(msg, 'content'):
                     for block in msg.content:
                         if hasattr(block, 'text'):

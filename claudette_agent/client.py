@@ -261,34 +261,27 @@ class Client:
 
         collected_text = []
         final_message = None
-        processed_ids = set()  # Track message IDs to avoid double-counting usage
         total_usage = usage()
         total_cost_usd = None
 
         try:
             async for msg in sdk_query(prompt=prompt, options=options):
-                # Check for ResultMessage which has total_cost_usd (per SDK docs)
+                # Check for ResultMessage which has usage and total_cost_usd
                 if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
+                    # Extract usage from ResultMessage (this is where usage actually is!)
+                    if hasattr(msg, 'usage') and msg.usage:
+                        total_usage = _parse_usage(msg.usage)
                     if hasattr(msg, 'total_cost_usd'):
                         total_cost_usd = msg.total_cost_usd
                     continue
 
-                # Process AssistantMessage for content and usage (per SDK docs)
-                # Use isinstance check as shown in documentation
+                # Process AssistantMessage for content only (usage is on ResultMessage)
                 if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
                     if hasattr(msg, 'content'):
                         final_message = _parse_sdk_message(msg)
                         for block in msg.content:
                             if hasattr(block, 'text'):
                                 collected_text.append(block.text)
-
-                    # Track usage - deduplicate by message ID (per SDK docs)
-                    if hasattr(msg, 'usage') and msg.usage:
-                        msg_id = getattr(msg, 'id', None)
-                        if msg_id and msg_id not in processed_ids:
-                            processed_ids.add(msg_id)
-                            msg_usage = _parse_usage(msg.usage)
-                            total_usage = total_usage + msg_usage
                 elif hasattr(msg, 'content'):
                     # Fallback for other message types with content
                     final_message = _parse_sdk_message(msg)
