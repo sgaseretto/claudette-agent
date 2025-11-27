@@ -24,6 +24,8 @@ try:
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
+    SDKAssistantMessage = None
+    SDKResultMessage = None
 
 
 def _parse_usage(u: Any) -> Usage:
@@ -265,25 +267,34 @@ class Client:
 
         try:
             async for msg in sdk_query(prompt=prompt, options=options):
-                # Check for ResultMessage which has total_cost_usd
-                if SDK_AVAILABLE and isinstance(msg, SDKResultMessage):
+                # Check for ResultMessage which has total_cost_usd (per SDK docs)
+                if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
                     if hasattr(msg, 'total_cost_usd'):
                         total_cost_usd = msg.total_cost_usd
                     continue
 
-                # Process AssistantMessage for content and usage
-                if hasattr(msg, 'content'):
+                # Process AssistantMessage for content and usage (per SDK docs)
+                # Use isinstance check as shown in documentation
+                if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
+                    if hasattr(msg, 'content'):
+                        final_message = _parse_sdk_message(msg)
+                        for block in msg.content:
+                            if hasattr(block, 'text'):
+                                collected_text.append(block.text)
+
+                    # Track usage - deduplicate by message ID (per SDK docs)
+                    if hasattr(msg, 'usage') and msg.usage:
+                        msg_id = getattr(msg, 'id', None)
+                        if msg_id and msg_id not in processed_ids:
+                            processed_ids.add(msg_id)
+                            msg_usage = _parse_usage(msg.usage)
+                            total_usage = total_usage + msg_usage
+                elif hasattr(msg, 'content'):
+                    # Fallback for other message types with content
                     final_message = _parse_sdk_message(msg)
                     for block in msg.content:
                         if hasattr(block, 'text'):
                             collected_text.append(block.text)
-
-                # Track usage - deduplicate by message ID
-                msg_id = getattr(msg, 'id', None)
-                if msg_id and msg_id not in processed_ids and hasattr(msg, 'usage') and msg.usage:
-                    processed_ids.add(msg_id)
-                    msg_usage = _parse_usage(msg.usage)
-                    total_usage = total_usage + msg_usage
 
         except Exception as e:
             # If SDK call fails, return error message
