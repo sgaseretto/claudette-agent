@@ -332,7 +332,7 @@ class Chat:
             **kw
         )
 
-    def toolloop(
+    async def toolloop(
         self,
         pr: Any,
         max_steps: int = 10,
@@ -350,35 +350,90 @@ class Chat:
             final_prompt: Prompt to add if last message is a tool call
 
         Returns:
-            Iterator of responses
-        """
-        async def _async_toolloop():
-            results = []
-            init_n = len(self.h)
+            List of responses
 
-            r = await self(pr, **kwargs)
+        Example:
+            >>> results = await chat.toolloop("Research Python async programming")
+            >>> for result in results:
+            ...     print(contents(result))
+        """
+        results = []
+        init_n = len(self.h)
+
+        r = await self(pr, **kwargs)
+        results.append(r)
+
+        if len(self.last) > 1:
+            results.append(self.last[1])
+
+        for i in range(max_steps - 1):
+            if self.c.stop_reason != 'tool_use':
+                break
+
+            prompt = final_prompt if i == max_steps - 2 else None
+            r = await self(prompt, **kwargs)
             results.append(r)
 
             if len(self.last) > 1:
                 results.append(self.last[1])
 
-            for i in range(max_steps - 1):
-                if self.c.stop_reason != 'tool_use':
-                    break
+            if not cont_func(*self.h[-3:]):
+                break
 
-                prompt = final_prompt if i == max_steps - 2 else None
-                r = await self(prompt, **kwargs)
-                results.append(r)
+        return results
 
-                if len(self.last) > 1:
-                    results.append(self.last[1])
+    async def stream(
+        self,
+        pr: Any,
+        temp: Optional[float] = None,
+        maxtok: int = 4096,
+        **kwargs
+    ):
+        """
+        Stream a response from Claude.
 
-                if not cont_func(*self.h[-3:]):
-                    break
+        Args:
+            pr: Prompt / message
+            temp: Temperature
+            maxtok: Maximum tokens
+            **kwargs: Additional options
 
-            return results
+        Yields:
+            Text chunks as they arrive
 
-        return asyncio.get_event_loop().run_until_complete(_async_toolloop())
+        Example:
+            >>> async for chunk in chat.stream("Tell me a story"):
+            ...     print(chunk, end="", flush=True)
+        """
+        from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
+
+        if temp is None:
+            temp = self.temp
+
+        # Add prompt to history
+        self._append_pr(pr)
+
+        # Build the conversation context
+        conversation_text = self._build_conversation_prompt()
+
+        # Build options
+        options = ClaudeAgentOptions(
+            system_prompt=self.sp or "You are a helpful assistant.",
+            max_turns=kwargs.get('max_turns', 1),
+        )
+
+        collected_text = []
+
+        async for msg in sdk_query(prompt=conversation_text, options=options):
+            if hasattr(msg, 'content'):
+                for block in msg.content:
+                    if hasattr(block, 'text'):
+                        collected_text.append(block.text)
+                        yield block.text
+
+        # Update history with the full response
+        full_response = "".join(collected_text)
+        self.h.append(mk_msg(full_response, role="assistant"))
 
     def _repr_markdown_(self) -> str:
         """Jupyter-friendly representation."""
@@ -490,16 +545,17 @@ class AsyncChat(Chat):
             cont_func: Function that stops loop if returns False
             final_prompt: Prompt to add if last message is a tool call
 
-        Yields:
-            Response messages
+        Returns:
+            List of response messages
         """
+        results = []
         init_n = len(self.h)
 
         r = await self(pr, **kwargs)
-        yield r
+        results.append(r)
 
         if len(self.last) > 1:
-            yield self.last[1]
+            results.append(self.last[1])
 
         for i in range(max_steps - 1):
             if self.c.stop_reason != 'tool_use':
@@ -507,10 +563,12 @@ class AsyncChat(Chat):
 
             prompt = final_prompt if i == max_steps - 2 else None
             r = await self(prompt, **kwargs)
-            yield r
+            results.append(r)
 
             if len(self.last) > 1:
-                yield self.last[1]
+                results.append(self.last[1])
 
             if not cont_func(*self.h[-3:]):
                 break
+
+        return results

@@ -29,8 +29,8 @@ import asyncio
 from claudette_agent import Chat, contents
 
 async def main():
-    # Create a chat with a system prompt
-    chat = Chat(sp="You are a helpful assistant")
+    # Create a chat with a model and system prompt
+    chat = Chat(model="claude-sonnet-4-5-20250929", sp="You are a helpful assistant")
 
     # Send a message
     response = await chat("Hello! What can you help me with?")
@@ -46,11 +46,15 @@ asyncio.run(main())
 ### Simple Query (No History)
 
 ```python
-from claudette_agent import query_sync, contents
+import asyncio
+from claudette_agent import query, contents
 
-# One-shot query
-response = query_sync("What is 2 + 2?")
-print(contents(response))
+async def main():
+    # One-shot query
+    response = await query("What is 2 + 2?")
+    print(contents(response))
+
+asyncio.run(main())
 ```
 
 ### Using Tools
@@ -71,6 +75,7 @@ def get_weather(city: str) -> str:
 
 async def main():
     chat = Chat(
+        model="claude-sonnet-4-5-20250929",
         sp="You are a helpful assistant with access to tools",
         tools=[calculate, get_weather]
     )
@@ -93,10 +98,10 @@ def search(query: str) -> str:
     return f"Results for '{query}': [relevant information]"
 
 async def main():
-    chat = Chat(tools=[search])
+    chat = Chat(model="claude-sonnet-4-5-20250929", tools=[search])
 
     # Automatically follow up tool calls
-    results = chat.toolloop(
+    results = await chat.toolloop(
         "Research Python async programming and summarize",
         max_steps=5
     )
@@ -121,8 +126,9 @@ class Person(BaseModel):
     occupation: str
 
 async def main():
-    chat = Chat()
+    chat = Chat(model="claude-sonnet-4-5-20250929")
 
+    # Note: prompt comes first, then the model class
     person = await chat.struct(
         "Extract: John Smith is a 35-year-old software engineer",
         Person
@@ -142,11 +148,9 @@ import asyncio
 from claudette_agent import Chat
 
 async def main():
-    chat = Chat()
+    chat = Chat(model="claude-sonnet-4-5-20250929")
 
-    stream = await chat.stream("Tell me a story about a brave knight")
-
-    async for chunk in stream:
+    async for chunk in chat.stream("Tell me a story about a brave knight"):
         print(chunk, end="", flush=True)
 
     print()  # Final newline
@@ -159,7 +163,7 @@ asyncio.run(main())
 ```python
 import asyncio
 from claudette_agent import (
-    Chat, MCPToolkit, mcp_tool, create_mcp_server
+    Chat, MCPToolkit, mcp_tool, create_mcp_server, contents
 )
 
 # Create tools for an MCP server
@@ -182,7 +186,7 @@ async def main():
     toolkit.add_sdk_server("math", [add, multiply])
 
     # Create chat with MCP servers
-    chat = Chat(sp="You are a calculator assistant")
+    chat = Chat(model="claude-sonnet-4-5-20250929", sp="You are a calculator assistant")
     chat.c.add_mcp_server("math", math_server)
 
     response = await chat("What is 15 + 27?")
@@ -198,7 +202,7 @@ import asyncio
 from claudette_agent import Chat, contents
 
 async def main():
-    chat = Chat()
+    chat = Chat(model="claude-sonnet-4-5-20250929")
 
     await chat("Explain quantum computing")
     await chat("What are its applications?")
@@ -224,7 +228,7 @@ asyncio.run(main())
 ### Key Functions
 
 - **`contents(response)`**: Extract text content from a response
-- **`query(prompt)`**: Simple one-shot query
+- **`query(prompt)`**: Simple one-shot query (async)
 - **`tool`**: Decorator to mark functions as tools
 - **`mk_msg(content)`**: Create a message dict
 - **`mk_msgs(msgs)`**: Convert messages to API format
@@ -232,7 +236,7 @@ asyncio.run(main())
 ### Structured Outputs
 
 - **`claude_schema(model)`**: Generate Claude schema from Pydantic model
-- **`struct_sync(chat, prompt, model)`**: Synchronous structured output
+- **`chat.struct(prompt, ModelClass)`**: Get structured output as Pydantic model
 
 ### MCP Integration
 
@@ -264,11 +268,12 @@ from claudette import Chat, contents
 from claudette_agent import Chat, contents
 ```
 
-Most code should work without changes. Some differences:
+Most code should work with minor changes:
 
-1. **Async by default**: The SDK is async-native, so `Chat.__call__` is async
-2. **MCP support**: Additional MCP server integration features
-3. **Session management**: Sessions are managed by the SDK
+1. **Async by default**: All `Chat` methods are async and need `await`
+2. **Model parameter**: Pass `model="claude-sonnet-4-5-20250929"` to `Chat()`
+3. **struct signature**: Use `chat.struct(prompt, ModelClass)` (prompt first)
+4. **MCP support**: Additional MCP server integration features
 
 ## License
 

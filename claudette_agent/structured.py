@@ -192,28 +192,30 @@ def add_struct_to_chat(chat_cls):
     """
     async def struct(
         self,
+        pr: Any,
         resp_model: Type[T],
         treat_as_output: bool = True,
-        pr: Any = None,
         **kwargs
     ) -> T:
         """
         Parse Claude output into a Pydantic model.
 
         Args:
+            pr: Prompt to send (required)
             resp_model: The Pydantic BaseModel class to parse into
             treat_as_output: Whether to treat result as output (adds to history)
-            pr: Optional prompt to send first
 
         Returns:
             Instance of resp_model with parsed data
+
+        Example:
+            >>> person = await chat.struct("Extract: John is 25", Person)
         """
         if not PYDANTIC_AVAILABLE:
             raise ImportError("pydantic is required for structured outputs")
 
-        # Append prompt if provided
-        if pr is not None:
-            self._append_pr(pr)
+        # Append prompt
+        self._append_pr(pr)
 
         # Build tool choice
         kwargs["tool_choice"] = mk_tool_choice(resp_model.__name__)
