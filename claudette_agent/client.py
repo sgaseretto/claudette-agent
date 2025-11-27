@@ -18,11 +18,35 @@ try:
         ClaudeSDKClient,
         ClaudeAgentOptions,
         AssistantMessage as SDKAssistantMessage,
+        ResultMessage as SDKResultMessage,
         TextBlock as SDKTextBlock,
     )
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
+
+
+def _parse_usage(u: Any) -> Usage:
+    """Parse usage from SDK message - handles both dict and object formats."""
+    if u is None:
+        return usage()
+
+    # SDK returns usage as a dict
+    if isinstance(u, dict):
+        return usage(
+            inp=u.get('input_tokens', 0),
+            out=u.get('output_tokens', 0),
+            cache_create=u.get('cache_creation_input_tokens', 0),
+            cache_read=u.get('cache_read_input_tokens', 0)
+        )
+
+    # Fall back to attribute access for compatibility
+    return usage(
+        inp=getattr(u, 'input_tokens', 0),
+        out=getattr(u, 'output_tokens', 0),
+        cache_create=getattr(u, 'cache_creation_input_tokens', 0),
+        cache_read=getattr(u, 'cache_read_input_tokens', 0)
+    )
 
 
 def _parse_sdk_message(msg: Any) -> Message:
@@ -46,14 +70,9 @@ def _parse_sdk_message(msg: Any) -> Message:
                 elif block.type == 'thinking':
                     content_blocks.append(ThinkingBlock(thinking=getattr(block, 'thinking', '')))
 
-    if hasattr(msg, 'usage'):
-        u = msg.usage
-        msg_usage = usage(
-            inp=getattr(u, 'input_tokens', 0),
-            out=getattr(u, 'output_tokens', 0),
-            cache_create=getattr(u, 'cache_creation_input_tokens', 0),
-            cache_read=getattr(u, 'cache_read_input_tokens', 0)
-        )
+    # Parse usage - SDK returns it as a dict
+    if hasattr(msg, 'usage') and msg.usage:
+        msg_usage = _parse_usage(msg.usage)
 
     return Message(
         id=getattr(msg, 'id', str(uuid.uuid4())),
@@ -240,14 +259,32 @@ class Client:
 
         collected_text = []
         final_message = None
+        processed_ids = set()  # Track message IDs to avoid double-counting usage
+        total_usage = usage()
+        total_cost_usd = None
 
         try:
             async for msg in sdk_query(prompt=prompt, options=options):
+                # Check for ResultMessage which has total_cost_usd
+                if SDK_AVAILABLE and isinstance(msg, SDKResultMessage):
+                    if hasattr(msg, 'total_cost_usd'):
+                        total_cost_usd = msg.total_cost_usd
+                    continue
+
+                # Process AssistantMessage for content and usage
                 if hasattr(msg, 'content'):
                     final_message = _parse_sdk_message(msg)
                     for block in msg.content:
                         if hasattr(block, 'text'):
                             collected_text.append(block.text)
+
+                # Track usage - deduplicate by message ID
+                msg_id = getattr(msg, 'id', None)
+                if msg_id and msg_id not in processed_ids and hasattr(msg, 'usage') and msg.usage:
+                    processed_ids.add(msg_id)
+                    msg_usage = _parse_usage(msg.usage)
+                    total_usage = total_usage + msg_usage
+
         except Exception as e:
             # If SDK call fails, return error message
             final_message = _simple_text_message(f"Error: {str(e)}")
@@ -255,7 +292,15 @@ class Client:
         if final_message is None:
             final_message = _simple_text_message("".join(collected_text) if collected_text else "No response")
 
+        # Attach total usage to the final message
+        if total_usage.total > 0:
+            final_message.usage = total_usage
+
         result = self._log_request(final_message, prefill, msgs if isinstance(msgs, list) else [msgs], sp=sp)
+
+        # Store SDK-reported cost if available
+        if total_cost_usd is not None:
+            self._last_cost_usd = total_cost_usd
 
         if cb:
             cb(result)

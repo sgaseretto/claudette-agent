@@ -28,11 +28,35 @@ try:
         tool as sdk_tool,
         create_sdk_mcp_server,
         AssistantMessage as SDKAssistantMessage,
+        ResultMessage as SDKResultMessage,
         TextBlock as SDKTextBlock,
     )
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
+
+
+def _parse_usage(u):
+    """Parse usage from SDK message - handles both dict and object formats."""
+    if u is None:
+        return usage()
+
+    # SDK returns usage as a dict
+    if isinstance(u, dict):
+        return usage(
+            inp=u.get('input_tokens', 0),
+            out=u.get('output_tokens', 0),
+            cache_create=u.get('cache_creation_input_tokens', 0),
+            cache_read=u.get('cache_read_input_tokens', 0)
+        )
+
+    # Fall back to attribute access for compatibility
+    return usage(
+        inp=getattr(u, 'input_tokens', 0),
+        out=getattr(u, 'output_tokens', 0),
+        cache_create=getattr(u, 'cache_creation_input_tokens', 0),
+        cache_read=getattr(u, 'cache_read_input_tokens', 0)
+    )
 
 
 def nested_idx(lst: List, *indices) -> Any:
@@ -326,14 +350,9 @@ class Chat:
                             input=getattr(block, 'input', {})
                         ))
 
-        if hasattr(msg, 'usage'):
-            u = msg.usage
-            msg_usage = usage(
-                inp=getattr(u, 'input_tokens', 0),
-                out=getattr(u, 'output_tokens', 0),
-                cache_create=getattr(u, 'cache_creation_input_tokens', 0),
-                cache_read=getattr(u, 'cache_read_input_tokens', 0)
-            )
+        # Parse usage - SDK returns it as a dict
+        if hasattr(msg, 'usage') and msg.usage:
+            msg_usage = _parse_usage(msg.usage)
 
         return Message(
             id=getattr(msg, 'id', str(uuid.uuid4())),
@@ -354,20 +373,32 @@ class Chat:
         """Make a call using ClaudeSDKClient (required for tools)."""
         collected_text = []
         final_message = None
+        processed_ids = set()  # Track message IDs to avoid double-counting usage
+        total_usage = usage()
 
         try:
             async with ClaudeSDKClient(options=options) as client:
                 await client.query(conversation_text)
 
                 async for msg in client.receive_response():
+                    # Check for ResultMessage which has total_cost_usd
+                    if SDK_AVAILABLE and isinstance(msg, SDKResultMessage):
+                        if hasattr(msg, 'total_cost_usd'):
+                            self.c._last_cost_usd = msg.total_cost_usd
+                        continue
+
                     if hasattr(msg, 'content'):
                         final_message = self._parse_sdk_message(msg)
                         for block in msg.content:
                             if hasattr(block, 'text'):
                                 collected_text.append(block.text)
-                    # Handle result message for cost tracking
-                    if hasattr(msg, 'total_cost_usd'):
-                        pass  # Could track costs here
+
+                    # Track usage - deduplicate by message ID
+                    msg_id = getattr(msg, 'id', None)
+                    if msg_id and msg_id not in processed_ids and hasattr(msg, 'usage') and msg.usage:
+                        processed_ids.add(msg_id)
+                        msg_usage = _parse_usage(msg.usage)
+                        total_usage = total_usage + msg_usage
 
         except Exception as e:
             final_message = Message(
@@ -384,6 +415,10 @@ class Chat:
                 content=[TextBlock(text="".join(collected_text) if collected_text else "No response")],
                 usage=usage()
             )
+
+        # Attach total usage to the final message
+        if total_usage.total > 0:
+            final_message.usage = total_usage
 
         return final_message
 
@@ -396,14 +431,30 @@ class Chat:
         """Make a simple call using query() (no tools)."""
         collected_text = []
         final_message = None
+        processed_ids = set()  # Track message IDs to avoid double-counting usage
+        total_usage = usage()
 
         try:
             async for msg in sdk_query(prompt=conversation_text, options=options):
+                # Check for ResultMessage which has total_cost_usd
+                if SDK_AVAILABLE and isinstance(msg, SDKResultMessage):
+                    if hasattr(msg, 'total_cost_usd'):
+                        self.c._last_cost_usd = msg.total_cost_usd
+                    continue
+
                 if hasattr(msg, 'content'):
                     final_message = self._parse_sdk_message(msg)
                     for block in msg.content:
                         if hasattr(block, 'text'):
                             collected_text.append(block.text)
+
+                # Track usage - deduplicate by message ID
+                msg_id = getattr(msg, 'id', None)
+                if msg_id and msg_id not in processed_ids and hasattr(msg, 'usage') and msg.usage:
+                    processed_ids.add(msg_id)
+                    msg_usage = _parse_usage(msg.usage)
+                    total_usage = total_usage + msg_usage
+
         except Exception as e:
             final_message = Message(
                 id=str(uuid.uuid4()),
@@ -419,6 +470,10 @@ class Chat:
                 content=[TextBlock(text="".join(collected_text) if collected_text else "No response")],
                 usage=usage()
             )
+
+        # Attach total usage to the final message
+        if total_usage.total > 0:
+            final_message.usage = total_usage
 
         return final_message
 
@@ -604,24 +659,56 @@ class Chat:
         options = self._build_options(**kwargs)
 
         collected_text = []
+        processed_ids = set()  # Track message IDs to avoid double-counting usage
+        total_usage = usage()
 
         # Use appropriate method based on whether we have tools
         if self._mcp_server:
             async with ClaudeSDKClient(options=options) as client:
                 await client.query(conversation_text)
                 async for msg in client.receive_response():
+                    # Check for ResultMessage
+                    if SDK_AVAILABLE and isinstance(msg, SDKResultMessage):
+                        if hasattr(msg, 'total_cost_usd'):
+                            self.c._last_cost_usd = msg.total_cost_usd
+                        continue
+
                     if hasattr(msg, 'content'):
                         for block in msg.content:
                             if hasattr(block, 'text'):
                                 collected_text.append(block.text)
                                 yield block.text
+
+                    # Track usage
+                    msg_id = getattr(msg, 'id', None)
+                    if msg_id and msg_id not in processed_ids and hasattr(msg, 'usage') and msg.usage:
+                        processed_ids.add(msg_id)
+                        msg_usage = _parse_usage(msg.usage)
+                        total_usage = total_usage + msg_usage
         else:
             async for msg in sdk_query(prompt=conversation_text, options=options):
+                # Check for ResultMessage
+                if SDK_AVAILABLE and isinstance(msg, SDKResultMessage):
+                    if hasattr(msg, 'total_cost_usd'):
+                        self.c._last_cost_usd = msg.total_cost_usd
+                    continue
+
                 if hasattr(msg, 'content'):
                     for block in msg.content:
                         if hasattr(block, 'text'):
                             collected_text.append(block.text)
                             yield block.text
+
+                # Track usage
+                msg_id = getattr(msg, 'id', None)
+                if msg_id and msg_id not in processed_ids and hasattr(msg, 'usage') and msg.usage:
+                    processed_ids.add(msg_id)
+                    msg_usage = _parse_usage(msg.usage)
+                    total_usage = total_usage + msg_usage
+
+        # Update usage on client
+        if total_usage.total > 0:
+            self.c.use = self.c.use + total_usage
 
         # Update history with the full response
         full_response = "".join(collected_text)
