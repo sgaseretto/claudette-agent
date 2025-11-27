@@ -111,11 +111,12 @@ async def test_sdk_raw_streaming():
     print("=" * 60)
 
     try:
-        from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
+        from claude_agent_sdk import query as sdk_query
 
-        options = ClaudeAgentOptions(
-            system_prompt="You are helpful. Be very brief."
-        )
+        # SDK expects options as a plain dict, NOT ClaudeAgentOptions
+        options = {
+            "system_prompt": "You are helpful. Be very brief."
+        }
 
         print("\nPrompt: Say hello in 5 words or less")
         print("\nRaw messages from SDK:\n")
@@ -127,15 +128,21 @@ async def test_sdk_raw_streaming():
 
             print(f"[Message {msg_count}] Type: {msg_type}")
 
+            # Print all attributes for debugging
+            print(f"  Dir: {[a for a in dir(msg) if not a.startswith('_')]}")
+
             # Print relevant attributes
             if hasattr(msg, 'content'):
                 print(f"  Content: {msg.content}")
             if hasattr(msg, 'usage'):
                 print(f"  Usage: {msg.usage}")
+                print(f"  Usage type: {type(msg.usage)}")
             if hasattr(msg, 'total_cost_usd'):
                 print(f"  Total Cost USD: {msg.total_cost_usd}")
             if hasattr(msg, 'id'):
                 print(f"  ID: {msg.id}")
+            if hasattr(msg, 'structured_output'):
+                print(f"  Structured Output: {msg.structured_output}")
 
             print()
 
@@ -144,7 +151,9 @@ async def test_sdk_raw_streaming():
     except ImportError as e:
         print(f"SDK not available: {e}")
     except Exception as e:
+        import traceback
         print(f"Error: {e}")
+        traceback.print_exc()
 
 
 async def main():

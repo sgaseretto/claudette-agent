@@ -17,7 +17,7 @@ except ImportError:
     BaseModel = object
 
 try:
-    from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
+    from claude_agent_sdk import query as sdk_query
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
@@ -235,7 +235,7 @@ def add_struct_to_chat(chat_cls):
         # Get JSON schema from Pydantic model
         json_schema = resp_model.model_json_schema()
 
-        # Build options with output_format
+        # Build options with output_format - SDK expects a plain dict
         opts = {
             'system_prompt': self.sp or "You are a helpful assistant.",
             'output_format': {
@@ -250,19 +250,27 @@ def add_struct_to_chat(chat_cls):
         if self.c.cwd:
             opts['cwd'] = self.c.cwd
 
-        options = ClaudeAgentOptions(**opts)
-
-        # Make the call and look for structured_output
+        # Make the call and look for structured_output on ANY message
         result_data = None
+        last_text = None
 
-        async for msg in sdk_query(prompt=conversation_text, options=options):
-            # Check for structured_output attribute
+        async for msg in sdk_query(prompt=conversation_text, options=opts):
+            # Check for structured_output attribute on any message (per SDK docs)
             if hasattr(msg, 'structured_output') and msg.structured_output:
                 result_data = msg.structured_output
-            # Also check for result message type
-            elif hasattr(msg, 'type') and msg.type == 'result':
-                if hasattr(msg, 'structured_output') and msg.structured_output:
-                    result_data = msg.structured_output
+
+            # Also capture text content as fallback
+            if hasattr(msg, 'content'):
+                for block in msg.content:
+                    if hasattr(block, 'text'):
+                        last_text = block.text
+
+        # If no structured_output, try parsing the text as JSON
+        if result_data is None and last_text:
+            try:
+                result_data = json.loads(last_text)
+            except json.JSONDecodeError:
+                pass
 
         if result_data is None:
             raise ValueError("No structured output received from Claude")
