@@ -183,8 +183,8 @@ class Client:
         tools: Optional[List] = None,
         maxtok: int = 4096,
         **kwargs
-    ) -> Dict[str, Any]:
-        """Build options dict for SDK query. SDK expects a plain dict, not ClaudeAgentOptions."""
+    ) -> 'ClaudeAgentOptions':
+        """Build ClaudeAgentOptions for SDK query."""
         opts = {
             'system_prompt': sp or "You are a helpful assistant.",
             'max_turns': kwargs.get('max_turns', 1),
@@ -202,7 +202,7 @@ class Client:
         if self._mcp_servers:
             opts['mcp_servers'] = self._mcp_servers
 
-        return opts
+        return ClaudeAgentOptions(**opts)
 
     async def __call__(
         self,

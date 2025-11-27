@@ -17,7 +17,7 @@ except ImportError:
     BaseModel = object
 
 try:
-    from claude_agent_sdk import query as sdk_query
+    from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
@@ -197,7 +197,8 @@ def add_struct_to_chat(chat_cls):
     """
     Add structured output support to a Chat class.
 
-    Uses the Claude Agent SDK's output_format feature for validated JSON output.
+    Uses prompt engineering to get JSON output matching a Pydantic schema,
+    since the SDK's output_format is not directly accessible via ClaudeAgentOptions.
     """
     async def struct(
         self,
@@ -207,7 +208,7 @@ def add_struct_to_chat(chat_cls):
         **kwargs
     ) -> T:
         """
-        Parse Claude output into a Pydantic model using SDK's output_format.
+        Parse Claude output into a Pydantic model.
 
         Args:
             pr: Prompt to send (required)
@@ -226,22 +227,27 @@ def add_struct_to_chat(chat_cls):
         if not SDK_AVAILABLE:
             raise ImportError("claude-agent-sdk is required for structured outputs")
 
-        # Append prompt to history
-        self._append_pr(pr)
+        # Get JSON schema from Pydantic model
+        json_schema = resp_model.model_json_schema()
+        schema_str = json.dumps(json_schema, indent=2)
+
+        # Build a structured prompt that asks for JSON output
+        structured_prompt = f"""{pr}
+
+Please respond with ONLY valid JSON that matches this schema:
+{schema_str}
+
+Important: Output ONLY the JSON object, no markdown code blocks, no explanations."""
+
+        # Append the structured prompt to history
+        self._append_pr(structured_prompt)
 
         # Build the conversation context
         conversation_text = self._build_conversation_prompt()
 
-        # Get JSON schema from Pydantic model
-        json_schema = resp_model.model_json_schema()
-
-        # Build options with output_format - SDK expects a plain dict
+        # Build options
         opts = {
-            'system_prompt': self.sp or "You are a helpful assistant.",
-            'output_format': {
-                'type': 'json_schema',
-                'schema': json_schema
-            }
+            'system_prompt': self.sp or "You are a helpful assistant that outputs valid JSON.",
         }
 
         if kwargs.get('max_turns'):
@@ -250,27 +256,39 @@ def add_struct_to_chat(chat_cls):
         if self.c.cwd:
             opts['cwd'] = self.c.cwd
 
-        # Make the call and look for structured_output on ANY message
+        options = ClaudeAgentOptions(**opts)
+
+        # Make the call and capture the response
         result_data = None
         last_text = None
 
-        async for msg in sdk_query(prompt=conversation_text, options=opts):
-            # Check for structured_output attribute on any message (per SDK docs)
+        async for msg in sdk_query(prompt=conversation_text, options=options):
+            # Check for structured_output attribute (in case SDK supports it)
             if hasattr(msg, 'structured_output') and msg.structured_output:
                 result_data = msg.structured_output
 
-            # Also capture text content as fallback
+            # Capture text content
             if hasattr(msg, 'content'):
                 for block in msg.content:
                     if hasattr(block, 'text'):
                         last_text = block.text
 
-        # If no structured_output, try parsing the text as JSON
+        # Parse the text response as JSON
         if result_data is None and last_text:
+            # Clean up potential markdown code blocks
+            text = last_text.strip()
+            if text.startswith('```json'):
+                text = text[7:]
+            if text.startswith('```'):
+                text = text[3:]
+            if text.endswith('```'):
+                text = text[:-3]
+            text = text.strip()
+
             try:
-                result_data = json.loads(last_text)
-            except json.JSONDecodeError:
-                pass
+                result_data = json.loads(text)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse JSON from Claude's response: {e}\nResponse: {last_text[:500]}")
 
         if result_data is None:
             raise ValueError("No structured output received from Claude")
@@ -278,13 +296,17 @@ def add_struct_to_chat(chat_cls):
         # Validate with Pydantic
         result = resp_model.model_validate(result_data)
 
-        # Update history
-        if treat_as_output:
-            msgs = [mk_msg(repr(result), "assistant")]
-        else:
-            msgs = [mk_msg(json.dumps(result_data), "assistant")]
+        # Update history with the result (replace the verbose prompt with just the original)
+        # Remove the structured prompt we added and add back just the original
+        if self.h:
+            self.h.pop()  # Remove the structured prompt
+        self.h.append(mk_msg(pr, cache=self.cache))  # Add original prompt
 
-        self.h.extend(msgs)
+        if treat_as_output:
+            self.h.append(mk_msg(repr(result), "assistant"))
+        else:
+            self.h.append(mk_msg(json.dumps(result_data), "assistant"))
+
         return result
 
     chat_cls.struct = struct

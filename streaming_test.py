@@ -111,12 +111,12 @@ async def test_sdk_raw_streaming():
     print("=" * 60)
 
     try:
-        from claude_agent_sdk import query as sdk_query
+        from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
 
-        # SDK expects options as a plain dict, NOT ClaudeAgentOptions
-        options = {
-            "system_prompt": "You are helpful. Be very brief."
-        }
+        # SDK requires ClaudeAgentOptions object
+        options = ClaudeAgentOptions(
+            system_prompt="You are helpful. Be very brief."
+        )
 
         print("\nPrompt: Say hello in 5 words or less")
         print("\nRaw messages from SDK:\n")

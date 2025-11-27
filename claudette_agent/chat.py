@@ -285,8 +285,8 @@ class Chat:
         prev_role = nested_idx(self.h, -1, 'role') if self.h else 'assistant'
         self._post_pr(pr, prev_role)
 
-    def _build_options(self, **kwargs) -> Dict[str, Any]:
-        """Build options dict for the SDK call. SDK expects a plain dict."""
+    def _build_options(self, **kwargs) -> 'ClaudeAgentOptions':
+        """Build ClaudeAgentOptions for the SDK call."""
         opts = {
             'system_prompt': self.sp or "You are a helpful assistant.",
         }
@@ -305,7 +305,7 @@ class Chat:
         if self._allowed_tools:
             opts['allowed_tools'] = self._allowed_tools
 
-        return opts
+        return ClaudeAgentOptions(**opts)
 
     def _build_conversation_prompt(self) -> str:
         """Build a conversation prompt from history."""
