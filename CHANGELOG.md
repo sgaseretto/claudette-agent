@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Stateless Queries (`setting_sources`)**: New `setting_sources` parameter on `Client`, `Chat`, and `AsyncChat` allows control over Claude Code settings loading:
+  - Default `[]` = stateless mode (no settings loaded, each query is independent)
+  - `['user', 'project', 'local']` = session persistence (loads Claude Code settings)
+  - Useful for API-style independent queries or parallel processing
+
 - **Extended Thinking Support**: `maxthinktok` parameter now properly enables extended thinking via SDK's `MAX_THINKING_TOKENS` environment variable. Works in `Client`, `Chat`, and `stream()` methods.
 
 - **ToolLoopResult Class**: `toolloop()` now returns a `ToolLoopResult` object that:
