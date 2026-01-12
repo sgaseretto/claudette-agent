@@ -72,6 +72,102 @@ pricing = {
 
 empty = inspect.Parameter.empty
 
+# Models with extended thinking support
+has_extended_thinking_models = {
+    'claude-sonnet-4-5-20250929',
+    'claude-opus-4-5-20251101',
+    'claude-opus-4-1-20250805',
+    'claude-sonnet-4-5',
+    'claude-opus-4-20250514',
+    'claude-sonnet-4-20250514',
+    'claude-3-7-sonnet-20250219',
+}
+
+# Text-only models (no vision support)
+text_only_models = {
+    'claude-3-haiku-20240307',
+}
+
+
+def can_stream(model: str = None) -> bool:
+    """
+    Check if a model supports streaming.
+
+    Args:
+        model: Model name (optional, returns True if None)
+
+    Returns:
+        True if model supports streaming
+    """
+    return True  # All Claude models via SDK support streaming
+
+
+def can_set_system_prompt(model: str = None) -> bool:
+    """
+    Check if a model supports system prompts.
+
+    Args:
+        model: Model name (optional, returns True if None)
+
+    Returns:
+        True if model supports system prompts
+    """
+    return True  # All Claude models support system prompts
+
+
+def can_set_temperature(model: str = None) -> bool:
+    """
+    Check if a model supports temperature setting.
+
+    Args:
+        model: Model name (optional, returns True if None)
+
+    Returns:
+        True if model supports temperature
+    """
+    return True  # All Claude models support temperature
+
+
+def can_use_extended_thinking(model: str = None) -> bool:
+    """
+    Check if a model supports extended thinking.
+
+    Args:
+        model: Model name (optional, returns True if None)
+
+    Returns:
+        True if model supports extended thinking
+
+    Example:
+        >>> can_use_extended_thinking('claude-sonnet-4-5-20250929')
+        True
+        >>> can_use_extended_thinking('claude-3-haiku-20240307')
+        False
+    """
+    if model is None:
+        return True
+    # Check against known models with thinking support
+    if model in has_extended_thinking_models:
+        return True
+    # Also check for partial matches (e.g., 'sonnet-4' in model name)
+    thinking_patterns = ['sonnet-4', 'opus-4', 'sonnet-3-7', '3.7']
+    return any(pattern in model.lower() for pattern in thinking_patterns)
+
+
+def can_use_vision(model: str = None) -> bool:
+    """
+    Check if a model supports vision (image) inputs.
+
+    Args:
+        model: Model name (optional, returns True if None)
+
+    Returns:
+        True if model supports vision inputs
+    """
+    if model is None:
+        return True
+    return model not in text_only_models
+
 
 @dataclass
 class Usage:
@@ -232,20 +328,125 @@ def contents(r: Message, show_thk: bool = True) -> str:
     return text
 
 
-def mk_msg(content: Union[str, Dict, List, Message], role: str = "user", cache: bool = False) -> Dict[str, Any]:
-    """Create a message dict for the API."""
+def mk_msg(content: Union[str, Dict, List, Message, bytes], role: str = "user", cache: bool = False) -> Dict[str, Any]:
+    """
+    Create a message dict for the API.
+
+    Supports text, dicts, lists, Message objects, and bytes (images).
+
+    Args:
+        content: The content to create a message from. Can be:
+            - str: Plain text message
+            - dict: Already formatted message (returned as-is)
+            - list: List of content blocks
+            - Message: Message object (converted to dict)
+            - bytes: Image data (converted to base64)
+        role: Message role ('user' or 'assistant')
+        cache: Whether to add cache control
+
+    Returns:
+        Dict with 'role' and 'content' keys
+    """
+    import base64
+
     if isinstance(content, dict):
         return content
     if isinstance(content, Message):
         return content.model_dump()
+    # Handle bytes as base64 image
+    if isinstance(content, bytes):
+        b64_data = base64.b64encode(content).decode('utf-8')
+        # Try to detect media type from magic bytes
+        media_type = _detect_image_type(content)
+        msg_content = [{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": b64_data
+            }
+        }]
+        if cache:
+            msg_content[-1]["cache_control"] = {"type": "ephemeral"}
+        return {"role": role, "content": msg_content}
     if isinstance(content, str):
         msg_content = [{"type": "text", "text": content}]
         if cache:
             msg_content[-1]["cache_control"] = {"type": "ephemeral"}
         return {"role": role, "content": msg_content}
     if isinstance(content, list):
-        return {"role": role, "content": content}
+        # Process list items - convert bytes to image blocks
+        processed = []
+        for item in content:
+            if isinstance(item, bytes):
+                b64_data = base64.b64encode(item).decode('utf-8')
+                media_type = _detect_image_type(item)
+                processed.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": b64_data
+                    }
+                })
+            elif isinstance(item, str):
+                processed.append({"type": "text", "text": item})
+            else:
+                processed.append(item)
+        return {"role": role, "content": processed}
     return {"role": role, "content": [{"type": "text", "text": str(content)}]}
+
+
+def _detect_image_type(data: bytes) -> str:
+    """Detect image MIME type from magic bytes."""
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    elif data[:2] == b'\xff\xd8':
+        return "image/jpeg"
+    elif data[:6] in (b'GIF87a', b'GIF89a'):
+        return "image/gif"
+    elif data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "image/webp"
+    # Default to PNG
+    return "image/png"
+
+
+def img_msg(data: bytes, media_type: str = None, role: str = "user", cache: bool = False) -> Dict[str, Any]:
+    """
+    Create an image message from bytes.
+
+    Args:
+        data: Image data as bytes
+        media_type: MIME type (e.g., 'image/png'). If None, auto-detected.
+        role: Message role ('user' or 'assistant')
+        cache: Whether to add cache control
+
+    Returns:
+        Dict with image content
+
+    Example:
+        >>> with open('image.png', 'rb') as f:
+        ...     msg = img_msg(f.read())
+    """
+    import base64
+
+    if media_type is None:
+        media_type = _detect_image_type(data)
+
+    b64_data = base64.b64encode(data).decode('utf-8')
+    msg_content = [{
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": b64_data
+        }
+    }]
+
+    if cache:
+        msg_content[-1]["cache_control"] = {"type": "ephemeral"}
+
+    return {"role": role, "content": msg_content}
 
 
 def mk_msgs(msgs: List[Any], cache: bool = False, cache_last_ckpt_only: bool = False) -> List[Dict]:
@@ -505,6 +706,48 @@ def think_md(txt: str, thk: str) -> str:
 {thk}
 </details>
 """
+
+
+class ToolLoopResult:
+    """
+    Wrapper for toolloop results with .value attribute for final result.
+
+    This class provides claudette-compatible iteration over toolloop results
+    while also providing a `.value` attribute to access the final meaningful result.
+
+    Example:
+        >>> results = await chat.toolloop("Research something")
+        >>> for msg in results:
+        ...     print(contents(msg))
+        >>> final = results.value  # Get the final response
+    """
+
+    def __init__(self, results: List[Any]):
+        self._results = results
+
+    def __iter__(self):
+        return iter(self._results)
+
+    def __len__(self):
+        return len(self._results)
+
+    def __getitem__(self, idx):
+        return self._results[idx]
+
+    def __repr__(self):
+        return f"ToolLoopResult({len(self._results)} messages)"
+
+    @property
+    def value(self) -> Any:
+        """Get the final/most meaningful result (last non-tool-use message)."""
+        for r in reversed(self._results):
+            if isinstance(r, Message) and r.stop_reason != 'tool_use':
+                return r
+        return self._results[-1] if self._results else None
+
+    def append(self, item):
+        """Append an item to results."""
+        self._results.append(item)
 
 
 def get_costs(c: 'Client') -> tuple:

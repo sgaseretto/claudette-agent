@@ -44,6 +44,7 @@ from .core import (
     ToolResultBlock,
     ThinkingBlock,
     ToolResult,
+    ToolLoopResult,
     # Utilities
     usage,
     find_block,
@@ -63,6 +64,13 @@ from .core import (
     call_func_async,
     think_md,
     get_costs,
+    img_msg,
+    # Capability checks
+    can_stream,
+    can_set_system_prompt,
+    can_set_temperature,
+    can_use_extended_thinking,
+    can_use_vision,
     # Constants
     empty,
     model_types,
@@ -72,6 +80,8 @@ from .core import (
     DEFAULT_MODEL,
     OPUS_MODEL,
     HAIKU_MODEL,
+    has_extended_thinking_models,
+    text_only_models,
 )
 
 # Client classes
@@ -122,6 +132,19 @@ from .mcp import (
     filesystem_server,
 )
 
+# Text editor tool
+from .text_editor import (
+    view,
+    create,
+    insert,
+    str_replace,
+    undo_edit,
+    str_replace_editor,
+    str_replace_based_edit_tool,
+    get_text_editor_schema,
+    text_editor_conf,
+)
+
 # Apply mixins to classes
 add_struct_to_client(Client)
 add_struct_to_client(AsyncClient)
@@ -141,6 +164,7 @@ __all__ = [
     'ToolResultBlock',
     'ThinkingBlock',
     'ToolResult',
+    'ToolLoopResult',
 
     # Utilities
     'usage',
@@ -161,6 +185,14 @@ __all__ = [
     'call_func_async',
     'think_md',
     'get_costs',
+    'img_msg',
+
+    # Capability checks
+    'can_stream',
+    'can_set_system_prompt',
+    'can_set_temperature',
+    'can_use_extended_thinking',
+    'can_use_vision',
 
     # Constants
     'empty',
@@ -171,6 +203,8 @@ __all__ = [
     'DEFAULT_MODEL',
     'OPUS_MODEL',
     'HAIKU_MODEL',
+    'has_extended_thinking_models',
+    'text_only_models',
 
     # Client classes
     'Client',
@@ -206,6 +240,17 @@ __all__ = [
     'mcp_tool',
     'sqlite_server',
     'filesystem_server',
+
+    # Text editor tool
+    'view',
+    'create',
+    'insert',
+    'str_replace',
+    'undo_edit',
+    'str_replace_editor',
+    'str_replace_based_edit_tool',
+    'get_text_editor_schema',
+    'text_editor_conf',
 ]
 
 
