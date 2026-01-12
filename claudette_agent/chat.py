@@ -16,7 +16,7 @@ from .core import (
     Usage, usage, Message, TextBlock, ToolUseBlock,
     contents, mk_msg, mk_msgs, mk_toolres, mk_toolres_async,
     get_schema, mk_tool_choice, listify, mk_ns, get_costs,
-    model_types, pricing, DEFAULT_MODEL
+    model_types, pricing, DEFAULT_MODEL, ToolLoopResult
 )
 from .client import Client, AsyncClient
 
@@ -285,7 +285,7 @@ class Chat:
         prev_role = nested_idx(self.h, -1, 'role') if self.h else 'assistant'
         self._post_pr(pr, prev_role)
 
-    def _build_options(self, **kwargs) -> 'ClaudeAgentOptions':
+    def _build_options(self, maxthinktok: int = 0, **kwargs) -> 'ClaudeAgentOptions':
         """Build ClaudeAgentOptions for the SDK call."""
         opts = {
             'system_prompt': self.sp or "You are a helpful assistant.",
@@ -304,6 +304,11 @@ class Chat:
         # Add allowed tools
         if self._allowed_tools:
             opts['allowed_tools'] = self._allowed_tools
+
+        # Enable extended thinking via environment variable
+        if maxthinktok and maxthinktok > 0:
+            opts['env'] = opts.get('env', {})
+            opts['env']['MAX_THINKING_TOKENS'] = str(maxthinktok)
 
         return ClaudeAgentOptions(**opts)
 
@@ -502,8 +507,12 @@ class Chat:
         # Build the full conversation context
         conversation_text = self._build_conversation_prompt()
 
-        # Build options
-        options = self._build_options(**kw)
+        # Add prefill instruction if provided
+        if prefill:
+            conversation_text = f"{conversation_text}\n\n[Start your response with: {prefill}]"
+
+        # Build options with extended thinking support
+        options = self._build_options(maxthinktok=maxthinktok, **kw)
 
         # Use ClaudeSDKClient if we have tools, otherwise use query()
         if self._mcp_server:
@@ -574,7 +583,7 @@ class Chat:
         cont_func: Callable = lambda *args: True,
         final_prompt: str = "You have no more tool uses. Please summarize your findings.",
         **kwargs
-    ):
+    ) -> ToolLoopResult:
         """
         Add prompt and get response, automatically following up with tool_use messages.
 
@@ -589,14 +598,15 @@ class Chat:
             final_prompt: Prompt to add if last message is a tool call
 
         Returns:
-            List of responses
+            ToolLoopResult with iterable messages and .value for final result
 
         Example:
             >>> results = await chat.toolloop("Research Python async programming")
             >>> for result in results:
             ...     print(contents(result))
+            >>> final = results.value  # Get final response
         """
-        results = []
+        results = ToolLoopResult([])
         init_n = len(self.h)
 
         # With SDK, the tool loop is handled internally
@@ -632,6 +642,7 @@ class Chat:
         pr: Any,
         temp: Optional[float] = None,
         maxtok: int = 4096,
+        maxthinktok: int = 0,
         **kwargs
     ):
         """
@@ -645,6 +656,7 @@ class Chat:
             pr: Prompt / message
             temp: Temperature
             maxtok: Maximum tokens
+            maxthinktok: Maximum thinking tokens for extended thinking
             **kwargs: Additional options
 
         Yields:
@@ -663,8 +675,8 @@ class Chat:
         # Build the conversation context
         conversation_text = self._build_conversation_prompt()
 
-        # Build options
-        options = self._build_options(**kwargs)
+        # Build options with extended thinking support
+        options = self._build_options(maxthinktok=maxthinktok, **kwargs)
 
         collected_text = []
         total_usage = usage()
@@ -827,7 +839,7 @@ class AsyncChat(Chat):
         cont_func: Callable = lambda *args: True,
         final_prompt: str = "You have no more tool uses. Please summarize your findings.",
         **kwargs
-    ):
+    ) -> ToolLoopResult:
         """
         Add prompt and get response, automatically following up with tool_use messages (async).
 
@@ -838,9 +850,9 @@ class AsyncChat(Chat):
             final_prompt: Prompt to add if last message is a tool call
 
         Returns:
-            List of response messages
+            ToolLoopResult with iterable messages and .value for final result
         """
-        results = []
+        results = ToolLoopResult([])
         init_n = len(self.h)
 
         # With SDK, set max_turns for tool handling

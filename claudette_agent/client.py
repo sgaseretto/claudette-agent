@@ -182,6 +182,7 @@ class Client:
         sp: str = '',
         tools: Optional[List] = None,
         maxtok: int = 4096,
+        maxthinktok: int = 0,
         **kwargs
     ) -> 'ClaudeAgentOptions':
         """Build ClaudeAgentOptions for SDK query."""
@@ -201,6 +202,11 @@ class Client:
 
         if self._mcp_servers:
             opts['mcp_servers'] = self._mcp_servers
+
+        # Enable extended thinking via environment variable
+        if maxthinktok and maxthinktok > 0:
+            opts['env'] = opts.get('env', {})
+            opts['env']['MAX_THINKING_TOKENS'] = str(maxthinktok)
 
         return ClaudeAgentOptions(**opts)
 
@@ -257,7 +263,11 @@ class Client:
                         prompt_parts.append(content)
             prompt = "\n\n".join(prompt_parts) if prompt_parts else str(msgs[-1])
 
-        options = self._build_options(sp=sp, tools=tools, maxtok=maxtok, **kwargs)
+        # Add prefill instruction to prompt if provided
+        if prefill:
+            prompt = f"{prompt}\n\n[Start your response with: {prefill}]"
+
+        options = self._build_options(sp=sp, tools=tools, maxtok=maxtok, maxthinktok=maxthinktok, **kwargs)
 
         collected_text = []
         final_message = None
