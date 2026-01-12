@@ -53,6 +53,7 @@ classDiagram
         +use: Usage
         +result: Message
         +stop_reason: str
+        +setting_sources: List[str]
         +__call__(msgs, sp, temp, maxtok, ...) Message
         +structured(msgs, tools, ...) List
         +cost: float
@@ -296,6 +297,30 @@ claudette_agent/
 └── text_editor.py   # Text editor tool
 ```
 
+## Stateless Mode (`setting_sources`)
+
+By default, claudette-agent runs in stateless mode (`setting_sources=[]`), meaning each query is independent:
+
+```mermaid
+flowchart LR
+    A[setting_sources] --> B{Value?}
+    B -->|"[]"| C[Stateless Mode]
+    B -->|"['user', 'project', 'local']"| D[Session Persistence]
+    C --> E[No settings loaded<br/>Independent queries<br/>Ideal for API use]
+    D --> F[Load ~/.claude/<br/>Load .claude/<br/>Session history]
+```
+
+The `setting_sources` parameter is passed through to `ClaudeAgentOptions`:
+
+```python
+opts = {
+    'system_prompt': sp,
+    'setting_sources': self.setting_sources,  # [] for stateless
+    # ... other options
+}
+ClaudeAgentOptions(**opts)
+```
+
 ## Feature Mapping: claudette → claudette-agent
 
 | claudette Feature | claudette-agent Implementation |
@@ -308,3 +333,4 @@ claudette_agent/
 | `cache` | Via `cache_control` in messages |
 | `struct()` | Via prompt engineering + JSON parsing |
 | `stream` | Via SDK async iterator |
+| `setting_sources` | Via `ClaudeAgentOptions.setting_sources` |

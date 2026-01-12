@@ -117,7 +117,8 @@ class Client:
         cache: bool = False,
         cwd: str = None,
         allowed_tools: List[str] = None,
-        permission_mode: str = "default"
+        permission_mode: str = "default",
+        setting_sources: List[str] = None
     ):
         """
         Initialize the Client.
@@ -130,6 +131,9 @@ class Client:
             cwd: Working directory for operations
             allowed_tools: List of allowed tools
             permission_mode: Permission mode for tools
+            setting_sources: List of setting sources to load ('user', 'project', 'local').
+                           Default [] = stateless (no settings loaded). Use ['user', 'project', 'local']
+                           for session persistence.
         """
         if not SDK_AVAILABLE:
             raise ImportError(
@@ -144,6 +148,7 @@ class Client:
         self.cwd = cwd
         self.allowed_tools = allowed_tools
         self.permission_mode = permission_mode
+        self.setting_sources = setting_sources if setting_sources is not None else []
         self.result: Optional[Message] = None
         self.stop_reason: Optional[str] = None
         self.stop_sequence: Optional[str] = None
@@ -189,6 +194,7 @@ class Client:
         opts = {
             'system_prompt': sp or "You are a helpful assistant.",
             'max_turns': kwargs.get('max_turns', 1),
+            'setting_sources': self.setting_sources,
         }
 
         if self.cwd:

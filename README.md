@@ -219,6 +219,42 @@ async def main():
 asyncio.run(main())
 ```
 
+### Stateless Queries (`setting_sources`)
+
+By default, claudette-agent runs in **stateless mode**, which is ideal for independent API queries:
+
+```python
+import asyncio
+from claudette_agent import Chat, AsyncChat
+
+async def main():
+    # Stateless by default (setting_sources=[])
+    # Each query is independent - no Claude Code settings loaded
+    chat = Chat(
+        model="claude-sonnet-4-5-20250929",
+        sp="You are a helpful assistant.",
+        setting_sources=[]  # Default - shown for clarity
+    )
+
+    # Explicit stateless mode
+    response = await chat("What is the meaning of life?")
+
+    # With session persistence (loads Claude Code settings)
+    session_chat = AsyncChat(
+        model="claude-sonnet-4-5-20250929",
+        setting_sources=['user', 'project', 'local']
+    )
+
+asyncio.run(main())
+```
+
+The `setting_sources` parameter controls what Claude Code loads at startup:
+- `[]` (empty/default) = Stateless mode, no settings loaded
+- `['user']` = Load user settings from `~/.claude/`
+- `['project']` = Load project settings from `.claude/`
+- `['local']` = Load local settings
+- `['user', 'project', 'local']` = Full session persistence
+
 ## API Reference
 
 ### Core Classes

@@ -170,7 +170,8 @@ class Chat:
         ns: Optional[Dict[str, Callable]] = None,
         cwd: str = None,
         allowed_tools: List[str] = None,
-        permission_mode: str = "default"
+        permission_mode: str = "default",
+        setting_sources: List[str] = None
     ):
         """
         Initialize the Chat.
@@ -188,6 +189,9 @@ class Chat:
             cwd: Working directory for operations
             allowed_tools: List of allowed SDK tools
             permission_mode: Permission mode for tools
+            setting_sources: List of setting sources to load ('user', 'project', 'local').
+                           Default [] = stateless (no settings loaded). Use ['user', 'project', 'local']
+                           for session persistence.
         """
         if not SDK_AVAILABLE:
             raise ImportError(
@@ -198,13 +202,20 @@ class Chat:
         assert model or cli, "Must provide either model or cli"
         assert cont_pr != "", "cont_pr may not be an empty string"
 
-        self.c = cli or Client(
-            model or DEFAULT_MODEL,
-            cache=cache,
-            cwd=cwd,
-            allowed_tools=allowed_tools,
-            permission_mode=permission_mode
-        )
+        # If Client provided, optionally update setting_sources
+        if cli is not None:
+            self.c = cli
+            if setting_sources is not None:
+                self.c.setting_sources = setting_sources
+        else:
+            self.c = Client(
+                model or DEFAULT_MODEL,
+                cache=cache,
+                cwd=cwd,
+                allowed_tools=allowed_tools,
+                permission_mode=permission_mode,
+                setting_sources=setting_sources if setting_sources is not None else []
+            )
 
         if hist is None:
             hist = []
@@ -289,6 +300,7 @@ class Chat:
         """Build ClaudeAgentOptions for the SDK call."""
         opts = {
             'system_prompt': self.sp or "You are a helpful assistant.",
+            'setting_sources': self.c.setting_sources,
         }
 
         if kwargs.get('max_turns'):
@@ -786,15 +798,26 @@ class AsyncChat(Chat):
         self,
         model: Optional[str] = None,
         cli: Optional[Client] = None,
+        setting_sources: List[str] = None,
         **kwargs
     ):
-        """Initialize the AsyncChat."""
-        super().__init__(model, cli, **kwargs)
+        """
+        Initialize the AsyncChat.
+
+        Args:
+            model: Model to use (leave empty if passing `cli`)
+            cli: Client to use (leave empty if passing `model`)
+            setting_sources: List of setting sources to load ('user', 'project', 'local').
+                           Default [] = stateless (no settings loaded). Use ['user', 'project', 'local']
+                           for session persistence.
+            **kwargs: Additional arguments passed to Chat
+        """
+        super().__init__(model, cli, setting_sources=setting_sources, **kwargs)
         if not cli:
             self.c = AsyncClient(model or DEFAULT_MODEL, **{
                 k: v for k, v in kwargs.items()
                 if k in ('cache', 'cwd', 'allowed_tools', 'permission_mode')
-            })
+            }, setting_sources=setting_sources if setting_sources is not None else [])
 
     async def _append_pr(self, pr: Any = None) -> None:
         """Append prompt to history (async version)."""
