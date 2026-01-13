@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Extra CLI Arguments (`extra_args`)**: New `extra_args` parameter on `Client`, `Chat`, and `AsyncChat` allows passing additional CLI arguments to ClaudeAgentOptions:
+  - Use `{'no-session-persistence': None}` to disable session persistence for truly stateless queries
+  - Keys should NOT include `--` prefix (SDK adds it internally)
+  - Format: `{'flag-name': None}` for flags, `{'option-name': 'value'}` for options with values
+  - Merges with SDK's `extra_args` for CLI argument passthrough
+  - Example: `Chat(model=..., setting_sources=[], extra_args={'no-session-persistence': None})`
+
 - **Environment Variables (`env`)**: New `env` parameter on `Client`, `Chat`, and `AsyncChat` allows passing custom environment variables to the Claude CLI process:
   - Pass any environment variable to the underlying Claude CLI
   - Enables true stateless queries by setting `HOME` to a temp directory (prevents session matching)

@@ -55,6 +55,7 @@ classDiagram
         +stop_reason: str
         +setting_sources: List[str]
         +env: Dict[str, str]
+        +extra_args: Dict[str, Any]
         +__call__(msgs, sp, temp, maxtok, ...) Message
         +structured(msgs, tools, ...) List
         +cost: float
@@ -363,6 +364,43 @@ response = await chat("Think deeply...", maxthinktok=2048)
 # env will contain both HOME and MAX_THINKING_TOKENS
 ```
 
+## Extra CLI Arguments (`extra_args`)
+
+The `extra_args` parameter allows passing additional CLI arguments to `ClaudeAgentOptions`:
+
+```mermaid
+flowchart LR
+    A[Client/Chat extra_args] --> B[_build_options]
+    B --> C[Merge into SDK extra_args]
+    C --> D[ClaudeAgentOptions]
+    D --> E[Claude CLI with flags]
+```
+
+This is particularly useful for truly stateless queries by disabling session persistence:
+
+```python
+# Truly stateless: no settings + no session persistence
+chat = Chat(
+    model='claude-sonnet-4-5-20250929',
+    setting_sources=[],  # Don't load settings
+    extra_args={'no-session-persistence': None}  # Don't persist session
+)
+```
+
+**Important**: Keys should NOT include the `--` prefix (SDK adds it internally):
+
+```python
+# Correct: SDK converts to --no-session-persistence
+extra_args = {'no-session-persistence': None}
+
+# For options with values
+extra_args = {'model': 'claude-sonnet-4-5-20250929'}  # Becomes --model claude-sonnet-4-5-20250929
+```
+
+The `extra_args` dictionary uses:
+- `{'flag-name': None}` for flags without values (e.g., `--no-session-persistence`)
+- `{'option-name': 'value'}` for options with values (e.g., `--model claude-sonnet-4-5-20250929`)
+
 ## Feature Mapping: claudette → claudette-agent
 
 | claudette Feature | claudette-agent Implementation |
@@ -377,3 +415,4 @@ response = await chat("Think deeply...", maxthinktok=2048)
 | `stream` | Via SDK async iterator |
 | `setting_sources` | Via `ClaudeAgentOptions.setting_sources` |
 | `env` | Via `ClaudeAgentOptions.env` (merged with internal vars) |
+| `extra_args` | Via `ClaudeAgentOptions.extra_args` (CLI argument passthrough) |

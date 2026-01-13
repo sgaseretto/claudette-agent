@@ -172,7 +172,8 @@ class Chat:
         allowed_tools: List[str] = None,
         permission_mode: str = "default",
         setting_sources: List[str] = None,
-        env: MutableMapping[str, str] = None
+        env: MutableMapping[str, str] = None,
+        extra_args: Dict[str, Any] = None
     ):
         """
         Initialize the Chat.
@@ -195,6 +196,8 @@ class Chat:
                            for session persistence.
             env: Environment variables to pass to the Claude CLI process. Useful for
                  setting HOME to a temp directory for true stateless queries.
+            extra_args: Additional arguments to pass to ClaudeAgentOptions. Useful for
+                       flags like no_session_persistence=True for truly stateless queries.
         """
         if not SDK_AVAILABLE:
             raise ImportError(
@@ -205,13 +208,15 @@ class Chat:
         assert model or cli, "Must provide either model or cli"
         assert cont_pr != "", "cont_pr may not be an empty string"
 
-        # If Client provided, optionally update setting_sources and env
+        # If Client provided, optionally update setting_sources, env, and extra_args
         if cli is not None:
             self.c = cli
             if setting_sources is not None:
                 self.c.setting_sources = setting_sources
             if env is not None:
                 self.c.env.update(env)
+            if extra_args is not None:
+                self.c.extra_args.update(extra_args)
         else:
             self.c = Client(
                 model or DEFAULT_MODEL,
@@ -220,7 +225,8 @@ class Chat:
                 allowed_tools=allowed_tools,
                 permission_mode=permission_mode,
                 setting_sources=setting_sources if setting_sources is not None else [],
-                env=env
+                env=env,
+                extra_args=extra_args
             )
 
         if hist is None:
@@ -827,7 +833,7 @@ class AsyncChat(Chat):
         if not cli:
             self.c = AsyncClient(model or DEFAULT_MODEL, **{
                 k: v for k, v in kwargs.items()
-                if k in ('cache', 'cwd', 'allowed_tools', 'permission_mode', 'env')
+                if k in ('cache', 'cwd', 'allowed_tools', 'permission_mode', 'env', 'extra_args')
             }, setting_sources=setting_sources if setting_sources is not None else [])
 
     async def _append_pr(self, pr: Any = None) -> None:
