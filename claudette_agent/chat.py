@@ -313,6 +313,8 @@ class Chat:
         opts = {
             'system_prompt': self.sp or "You are a helpful assistant.",
             'setting_sources': self.c.setting_sources,
+            'continue_conversation': False,  # Ensure stateless - don't continue most recent conversation
+            'resume': None,  # Ensure stateless - don't resume any previous session
         }
 
         if kwargs.get('max_turns'):
