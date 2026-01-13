@@ -10,7 +10,7 @@ Key differences from Claudette:
 import asyncio
 import uuid
 import inspect
-from typing import Any, Dict, List, Optional, Union, Callable, get_type_hints
+from typing import Any, Dict, List, Optional, Union, Callable, get_type_hints, MutableMapping
 
 from .core import (
     Usage, usage, Message, TextBlock, ToolUseBlock,
@@ -171,7 +171,8 @@ class Chat:
         cwd: str = None,
         allowed_tools: List[str] = None,
         permission_mode: str = "default",
-        setting_sources: List[str] = None
+        setting_sources: List[str] = None,
+        env: MutableMapping[str, str] = None
     ):
         """
         Initialize the Chat.
@@ -192,6 +193,8 @@ class Chat:
             setting_sources: List of setting sources to load ('user', 'project', 'local').
                            Default [] = stateless (no settings loaded). Use ['user', 'project', 'local']
                            for session persistence.
+            env: Environment variables to pass to the Claude CLI process. Useful for
+                 setting HOME to a temp directory for true stateless queries.
         """
         if not SDK_AVAILABLE:
             raise ImportError(
@@ -202,11 +205,13 @@ class Chat:
         assert model or cli, "Must provide either model or cli"
         assert cont_pr != "", "cont_pr may not be an empty string"
 
-        # If Client provided, optionally update setting_sources
+        # If Client provided, optionally update setting_sources and env
         if cli is not None:
             self.c = cli
             if setting_sources is not None:
                 self.c.setting_sources = setting_sources
+            if env is not None:
+                self.c.env.update(env)
         else:
             self.c = Client(
                 model or DEFAULT_MODEL,
@@ -214,7 +219,8 @@ class Chat:
                 cwd=cwd,
                 allowed_tools=allowed_tools,
                 permission_mode=permission_mode,
-                setting_sources=setting_sources if setting_sources is not None else []
+                setting_sources=setting_sources if setting_sources is not None else [],
+                env=env
             )
 
         if hist is None:
@@ -316,6 +322,11 @@ class Chat:
         # Add allowed tools
         if self._allowed_tools:
             opts['allowed_tools'] = self._allowed_tools
+
+        # Merge environment variables from client instance
+        if self.c.env:
+            opts['env'] = opts.get('env', {})
+            opts['env'].update(self.c.env)
 
         # Enable extended thinking via environment variable
         if maxthinktok and maxthinktok > 0:
@@ -816,7 +827,7 @@ class AsyncChat(Chat):
         if not cli:
             self.c = AsyncClient(model or DEFAULT_MODEL, **{
                 k: v for k, v in kwargs.items()
-                if k in ('cache', 'cwd', 'allowed_tools', 'permission_mode')
+                if k in ('cache', 'cwd', 'allowed_tools', 'permission_mode', 'env')
             }, setting_sources=setting_sources if setting_sources is not None else [])
 
     async def _append_pr(self, pr: Any = None) -> None:

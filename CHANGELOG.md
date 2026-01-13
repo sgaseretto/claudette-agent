@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Environment Variables (`env`)**: New `env` parameter on `Client`, `Chat`, and `AsyncChat` allows passing custom environment variables to the Claude CLI process:
+  - Pass any environment variable to the underlying Claude CLI
+  - Enables true stateless queries by setting `HOME` to a temp directory (prevents session matching)
+  - Example: `Chat(model=..., env={'HOME': '/tmp/unique-dir'})` for fully isolated queries
+  - Merged with internal env vars (like `MAX_THINKING_TOKENS` for extended thinking)
+
 - **Stateless Queries (`setting_sources`)**: New `setting_sources` parameter on `Client`, `Chat`, and `AsyncChat` allows control over Claude Code settings loading:
   - Default `[]` = stateless mode (no settings loaded, each query is independent)
   - `['user', 'project', 'local']` = session persistence (loads Claude Code settings)
