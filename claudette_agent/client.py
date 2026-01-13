@@ -119,7 +119,8 @@ class Client:
         allowed_tools: List[str] = None,
         permission_mode: str = "default",
         setting_sources: List[str] = None,
-        env: MutableMapping[str, str] = None
+        env: MutableMapping[str, str] = None,
+        extra_args: Dict[str, Any] = None
     ):
         """
         Initialize the Client.
@@ -137,6 +138,8 @@ class Client:
                            for session persistence.
             env: Environment variables to pass to the Claude CLI process. Useful for
                  setting HOME to a temp directory for true stateless queries.
+            extra_args: Additional arguments to pass to ClaudeAgentOptions. Useful for
+                       flags like no_session_persistence=True for truly stateless queries.
         """
         if not SDK_AVAILABLE:
             raise ImportError(
@@ -153,6 +156,7 @@ class Client:
         self.permission_mode = permission_mode
         self.setting_sources = setting_sources if setting_sources is not None else []
         self.env = dict(env) if env else {}
+        self.extra_args = dict(extra_args) if extra_args else {}
         self.result: Optional[Message] = None
         self.stop_reason: Optional[str] = None
         self.stop_sequence: Optional[str] = None
@@ -222,6 +226,14 @@ class Client:
         if maxthinktok and maxthinktok > 0:
             opts['env'] = opts.get('env', {})
             opts['env']['MAX_THINKING_TOKENS'] = str(maxthinktok)
+
+        # Merge extra_args into SDK's extra_args for CLI arguments
+        # SDK's extra_args is dict[str, str | None] for CLI flags
+        # Keys should NOT include '--' prefix (SDK adds it internally)
+        # Example: {'no-session-persistence': None} becomes --no-session-persistence
+        if self.extra_args:
+            opts['extra_args'] = opts.get('extra_args', {})
+            opts['extra_args'].update(self.extra_args)
 
         return ClaudeAgentOptions(**opts)
 
