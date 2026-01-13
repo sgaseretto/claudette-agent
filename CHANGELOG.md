@@ -70,6 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `toolloop()` return type changed from `List` to `ToolLoopResult` (backward compatible)
 - `_build_options()` methods now accept and process `maxthinktok` parameter
+- `_build_options()` now explicitly sets `continue_conversation=False` and `resume=None` to ensure stateless queries (SDK defaults were already these values, but now explicit for clarity)
 
 ## [0.1.0] - 2025-01-08
 

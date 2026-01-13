@@ -299,29 +299,51 @@ claudette_agent/
 └── text_editor.py   # Text editor tool
 ```
 
-## Stateless Mode (`setting_sources`)
+## Stateless Mode
 
-By default, claudette-agent runs in stateless mode (`setting_sources=[]`), meaning each query is independent:
+By default, claudette-agent runs in stateless mode, meaning each query is independent. This is achieved through multiple mechanisms:
 
 ```mermaid
-flowchart LR
-    A[setting_sources] --> B{Value?}
-    B -->|"[]"| C[Stateless Mode]
-    B -->|"['user', 'project', 'local']"| D[Session Persistence]
-    C --> E[No settings loaded<br/>Independent queries<br/>Ideal for API use]
-    D --> F[Load ~/.claude/<br/>Load .claude/<br/>Session history]
+flowchart TB
+    subgraph "Stateless Mechanisms"
+        A[setting_sources=[]] --> E[No settings loaded]
+        B[continue_conversation=False] --> F[Don't continue recent conversation]
+        C[resume=None] --> G[Don't resume previous session]
+        D[optional: env/extra_args] --> H[Isolate CLI process]
+    end
+
+    subgraph "Result"
+        E --> I[Independent Queries]
+        F --> I
+        G --> I
+        H --> I
+    end
 ```
 
-The `setting_sources` parameter is passed through to `ClaudeAgentOptions`:
+### Built-in Stateless Options
+
+The `_build_options()` method explicitly sets stateless parameters:
 
 ```python
 opts = {
     'system_prompt': sp,
-    'setting_sources': self.setting_sources,  # [] for stateless
+    'setting_sources': self.setting_sources,  # [] for stateless by default
+    'continue_conversation': False,  # Don't continue most recent conversation
+    'resume': None,  # Don't resume any previous session
     # ... other options
 }
 ClaudeAgentOptions(**opts)
 ```
+
+### Stateless Configuration Options
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `setting_sources=[]` | Yes | No settings loaded from filesystem |
+| `continue_conversation=False` | Yes | Don't continue the most recent conversation |
+| `resume=None` | Yes | Don't resume any previous session ID |
+| `env={'HOME': ...}` | No | Isolate CLI config directory (optional, for maximum isolation) |
+| `extra_args={'no-session-persistence': None}` | No | Disable session persistence (optional) |
 
 ## Environment Variables (`env`)
 
