@@ -3,7 +3,7 @@ Client module - Main Client and AsyncClient classes for claudette_agent.
 """
 import asyncio
 import uuid
-from typing import Any, Dict, List, Optional, Union, Callable, AsyncIterator, Iterator
+from typing import Any, Dict, List, Optional, Union, Callable, AsyncIterator, Iterator, MutableMapping
 
 from .core import (
     Usage, usage, Message, TextBlock, ToolUseBlock, ThinkingBlock,
@@ -118,7 +118,8 @@ class Client:
         cwd: str = None,
         allowed_tools: List[str] = None,
         permission_mode: str = "default",
-        setting_sources: List[str] = None
+        setting_sources: List[str] = None,
+        env: MutableMapping[str, str] = None
     ):
         """
         Initialize the Client.
@@ -134,6 +135,8 @@ class Client:
             setting_sources: List of setting sources to load ('user', 'project', 'local').
                            Default [] = stateless (no settings loaded). Use ['user', 'project', 'local']
                            for session persistence.
+            env: Environment variables to pass to the Claude CLI process. Useful for
+                 setting HOME to a temp directory for true stateless queries.
         """
         if not SDK_AVAILABLE:
             raise ImportError(
@@ -149,6 +152,7 @@ class Client:
         self.allowed_tools = allowed_tools
         self.permission_mode = permission_mode
         self.setting_sources = setting_sources if setting_sources is not None else []
+        self.env = dict(env) if env else {}
         self.result: Optional[Message] = None
         self.stop_reason: Optional[str] = None
         self.stop_sequence: Optional[str] = None
@@ -208,6 +212,11 @@ class Client:
 
         if self._mcp_servers:
             opts['mcp_servers'] = self._mcp_servers
+
+        # Merge environment variables from client instance
+        if self.env:
+            opts['env'] = opts.get('env', {})
+            opts['env'].update(self.env)
 
         # Enable extended thinking via environment variable
         if maxthinktok and maxthinktok > 0:

@@ -54,6 +54,7 @@ classDiagram
         +result: Message
         +stop_reason: str
         +setting_sources: List[str]
+        +env: Dict[str, str]
         +__call__(msgs, sp, temp, maxtok, ...) Message
         +structured(msgs, tools, ...) List
         +cost: float
@@ -321,6 +322,47 @@ opts = {
 ClaudeAgentOptions(**opts)
 ```
 
+## Environment Variables (`env`)
+
+The `env` parameter allows passing custom environment variables to the Claude CLI process:
+
+```mermaid
+flowchart LR
+    A[Client/Chat env] --> B[_build_options]
+    B --> C[Merge with internal env]
+    C --> D[ClaudeAgentOptions]
+    D --> E[Claude CLI Process]
+```
+
+This is particularly useful for achieving true statelessness by isolating the Claude CLI's configuration directory:
+
+```python
+import tempfile
+import os
+
+# Create unique temp directory for this query
+unique_dir = tempfile.mkdtemp()
+
+# Pass HOME to isolate ~/.claude/ directory
+chat = Chat(
+    model='claude-sonnet-4-5-20250929',
+    setting_sources=[],
+    env={'HOME': unique_dir}  # Fresh ~/.claude/ per query
+)
+```
+
+The `env` parameter is merged with internal environment variables (like `MAX_THINKING_TOKENS` for extended thinking), so you can use both features together:
+
+```python
+# Extended thinking with isolated environment
+chat = Chat(
+    model='claude-sonnet-4-5-20250929',
+    env={'HOME': '/tmp/isolated'}
+)
+response = await chat("Think deeply...", maxthinktok=2048)
+# env will contain both HOME and MAX_THINKING_TOKENS
+```
+
 ## Feature Mapping: claudette → claudette-agent
 
 | claudette Feature | claudette-agent Implementation |
@@ -334,3 +376,4 @@ ClaudeAgentOptions(**opts)
 | `struct()` | Via prompt engineering + JSON parsing |
 | `stream` | Via SDK async iterator |
 | `setting_sources` | Via `ClaudeAgentOptions.setting_sources` |
+| `env` | Via `ClaudeAgentOptions.env` (merged with internal vars) |
