@@ -3,13 +3,17 @@ Client module - Main Client and AsyncClient classes for claudette_agent.
 """
 import asyncio
 import uuid
-from typing import Any, Dict, List, Optional, Union, Callable, AsyncIterator, Iterator, MutableMapping
+from typing import Any, Dict, List, Optional, Union, Callable, AsyncIterator, Iterator, MutableMapping, Literal
 
 from .core import (
     Usage, usage, Message, TextBlock, ToolUseBlock, ThinkingBlock,
     find_block, contents, mk_msg, mk_msgs, mk_toolres, mk_toolres_async,
     get_schema, mk_tool_choice, listify, mk_ns, call_func,
-    model_types, pricing, DEFAULT_MODEL
+    model_types, pricing, DEFAULT_MODEL,
+    _parse_usage, _parse_sdk_message, _simple_text_message,
+    AssistantMessage as SDKAssistantMessage,
+    ResultMessage as SDKResultMessage,
+    StreamEvent,
 )
 
 try:
@@ -17,91 +21,23 @@ try:
         query as sdk_query,
         ClaudeSDKClient,
         ClaudeAgentOptions,
-        AssistantMessage as SDKAssistantMessage,
-        ResultMessage as SDKResultMessage,
-        TextBlock as SDKTextBlock,
     )
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
-    SDKAssistantMessage = None
-    SDKResultMessage = None
 
 
-def _parse_usage(u: Any) -> Usage:
-    """Parse usage from SDK message - handles both dict and object formats."""
-    if u is None:
-        return usage()
-
-    # SDK returns usage as a dict
-    if isinstance(u, dict):
-        return usage(
-            inp=u.get('input_tokens', 0),
-            out=u.get('output_tokens', 0),
-            cache_create=u.get('cache_creation_input_tokens', 0),
-            cache_read=u.get('cache_read_input_tokens', 0)
-        )
-
-    # Fall back to attribute access for compatibility
-    return usage(
-        inp=getattr(u, 'input_tokens', 0),
-        out=getattr(u, 'output_tokens', 0),
-        cache_create=getattr(u, 'cache_creation_input_tokens', 0),
-        cache_read=getattr(u, 'cache_read_input_tokens', 0)
-    )
-
-
-def _parse_sdk_message(msg: Any) -> Message:
-    """Convert SDK message to our Message format."""
-    content_blocks = []
-    msg_usage = usage()
-
-    if hasattr(msg, 'content'):
-        for block in msg.content:
-            if hasattr(block, 'text'):
-                content_blocks.append(TextBlock(text=block.text))
-            elif hasattr(block, 'type'):
-                if block.type == 'text':
-                    content_blocks.append(TextBlock(text=getattr(block, 'text', '')))
-                elif block.type == 'tool_use':
-                    content_blocks.append(ToolUseBlock(
-                        id=getattr(block, 'id', ''),
-                        name=getattr(block, 'name', ''),
-                        input=getattr(block, 'input', {})
-                    ))
-                elif block.type == 'thinking':
-                    content_blocks.append(ThinkingBlock(thinking=getattr(block, 'thinking', '')))
-
-    # Parse usage - SDK returns it as a dict
-    if hasattr(msg, 'usage') and msg.usage:
-        msg_usage = _parse_usage(msg.usage)
-
-    return Message(
-        id=getattr(msg, 'id', str(uuid.uuid4())),
-        role=getattr(msg, 'role', 'assistant'),
-        content=content_blocks,
-        model=getattr(msg, 'model', ''),
-        stop_reason=getattr(msg, 'stop_reason', None),
-        stop_sequence=getattr(msg, 'stop_sequence', None),
-        usage=msg_usage
-    )
-
-
-def _simple_text_message(text: str) -> Message:
-    """Create a simple text message."""
-    return Message(
-        id=str(uuid.uuid4()),
-        role='assistant',
-        content=[TextBlock(text=text)],
-        usage=usage()
-    )
+def _has_option(name: str) -> bool:
+    """Check if ClaudeAgentOptions supports a given field."""
+    if not SDK_AVAILABLE:
+        return False
+    import dataclasses
+    return name in {f.name for f in dataclasses.fields(ClaudeAgentOptions)}
 
 
 class Client:
     """
     Claude Agent SDK client with Claudette-compatible API.
-
-    This client wraps the claude-agent-sdk to provide the same interface as Claudette.
 
     Example:
         >>> client = Client('claude-sonnet-4-5-20250929')
@@ -120,7 +56,17 @@ class Client:
         permission_mode: str = "default",
         setting_sources: List[str] = None,
         env: MutableMapping[str, str] = None,
-        extra_args: Dict[str, Any] = None
+        extra_args: Dict[str, Any] = None,
+        # New SDK features
+        max_turns: int = None,
+        max_budget_usd: float = None,
+        fallback_model: str = None,
+        can_use_tool: Callable = None,
+        hooks: Dict = None,
+        agents: Dict = None,
+        enable_file_checkpointing: bool = False,
+        thinking: Any = None,
+        effort: Literal["low", "medium", "high", "max"] = None,
     ):
         """
         Initialize the Client.
@@ -134,12 +80,20 @@ class Client:
             allowed_tools: List of allowed tools
             permission_mode: Permission mode for tools
             setting_sources: List of setting sources to load ('user', 'project', 'local').
-                           Default [] = stateless (no settings loaded). Use ['user', 'project', 'local']
-                           for session persistence.
-            env: Environment variables to pass to the Claude CLI process. Useful for
-                 setting HOME to a temp directory for true stateless queries.
-            extra_args: Additional arguments to pass to ClaudeAgentOptions. Useful for
-                       flags like no_session_persistence=True for truly stateless queries.
+                           Default [] = stateless (no settings loaded).
+            env: Environment variables to pass to the Claude CLI process.
+            extra_args: Additional CLI arguments to pass to ClaudeAgentOptions.
+            max_turns: Maximum agentic turns (tool-use round trips)
+            max_budget_usd: Maximum budget in USD for the session
+            fallback_model: Fallback model if primary fails
+            can_use_tool: Custom permission callback for tool use
+            hooks: Hook configurations for intercepting events
+            agents: Subagent definitions
+            enable_file_checkpointing: Enable file change tracking for rewinding
+            thinking: Extended thinking config - can be:
+                      {"type": "adaptive"}, {"type": "enabled", "budget_tokens": N},
+                      {"type": "disabled"}, or None
+            effort: Effort level for thinking depth ("low", "medium", "high", "max")
         """
         if not SDK_AVAILABLE:
             raise ImportError(
@@ -157,6 +111,15 @@ class Client:
         self.setting_sources = setting_sources if setting_sources is not None else []
         self.env = dict(env) if env else {}
         self.extra_args = dict(extra_args) if extra_args else {}
+        self.max_turns = max_turns
+        self.max_budget_usd = max_budget_usd
+        self.fallback_model = fallback_model
+        self.can_use_tool = can_use_tool
+        self.hooks = hooks
+        self.agents = agents
+        self.enable_file_checkpointing = enable_file_checkpointing
+        self.thinking = thinking
+        self.effort = effort
         self.result: Optional[Message] = None
         self.stop_reason: Optional[str] = None
         self.stop_sequence: Optional[str] = None
@@ -165,10 +128,6 @@ class Client:
 
     def _r(self, r: Message, prefill: str = '') -> Message:
         """Store the result of the message and accrue total usage."""
-        if prefill:
-            blk = find_block(r)
-            if blk and hasattr(blk, 'text'):
-                blk.text = prefill + (blk.text or '')
         self.result = r
         if r.usage:
             self.use = self.use + r.usage
@@ -196,12 +155,19 @@ class Client:
         tools: Optional[List] = None,
         maxtok: int = 4096,
         maxthinktok: int = 0,
+        stream: bool = False,
         **kwargs
     ) -> 'ClaudeAgentOptions':
         """Build ClaudeAgentOptions for SDK query."""
+        # System prompt: support string or dict (preset)
+        if isinstance(sp, dict):
+            system_prompt = sp
+        else:
+            system_prompt = sp or "You are a helpful assistant."
+
         opts = {
-            'system_prompt': sp or "You are a helpful assistant.",
-            'max_turns': kwargs.get('max_turns', 1),
+            'system_prompt': system_prompt,
+            'max_turns': kwargs.get('max_turns') or self.max_turns or 1,
             'setting_sources': self.setting_sources,
         }
 
@@ -222,15 +188,52 @@ class Client:
             opts['env'] = opts.get('env', {})
             opts['env'].update(self.env)
 
-        # Enable extended thinking via environment variable
+        # Extended thinking via native SDK support
         if maxthinktok and maxthinktok > 0:
-            opts['env'] = opts.get('env', {})
-            opts['env']['MAX_THINKING_TOKENS'] = str(maxthinktok)
+            if stream:
+                raise ValueError(
+                    "Streaming is incompatible with extended thinking in the Claude Agent SDK. "
+                    "Use stream=False when using maxthinktok, or set maxthinktok=0 for streaming."
+                )
+            # Use max_thinking_tokens (current SDK) or thinking (future SDK)
+            if _has_option('thinking'):
+                opts['thinking'] = {"type": "enabled", "budget_tokens": maxthinktok}
+            else:
+                opts['max_thinking_tokens'] = maxthinktok
+        elif self.thinking:
+            if _has_option('thinking'):
+                opts['thinking'] = self.thinking
+            elif isinstance(self.thinking, dict) and self.thinking.get('type') == 'enabled':
+                opts['max_thinking_tokens'] = self.thinking.get('budget_tokens', 0)
+
+        # Effort level (if SDK supports it)
+        if self.effort and _has_option('effort'):
+            opts['effort'] = self.effort
+
+        # Streaming: enable partial messages for char-by-char streaming
+        if stream:
+            opts['include_partial_messages'] = True
+
+        # New SDK features
+        if self.max_budget_usd is not None:
+            opts['max_budget_usd'] = self.max_budget_usd
+
+        if self.fallback_model:
+            opts['fallback_model'] = self.fallback_model
+
+        if self.can_use_tool:
+            opts['can_use_tool'] = self.can_use_tool
+
+        if self.hooks:
+            opts['hooks'] = self.hooks
+
+        if self.agents:
+            opts['agents'] = self.agents
+
+        if self.enable_file_checkpointing:
+            opts['enable_file_checkpointing'] = True
 
         # Merge extra_args into SDK's extra_args for CLI arguments
-        # SDK's extra_args is dict[str, str | None] for CLI flags
-        # Keys should NOT include '--' prefix (SDK adds it internally)
-        # Example: {'no-session-persistence': None} becomes --no-session-persistence
         if self.extra_args:
             opts['extra_args'] = opts.get('extra_args', {})
             opts['extra_args'].update(self.extra_args)
@@ -257,7 +260,8 @@ class Client:
 
         Args:
             msgs: List of messages or a single message string
-            sp: System prompt
+            sp: System prompt (string or dict for preset, e.g.
+                {"type": "preset", "preset": "claude_code", "append": "..."})
             temp: Temperature (note: may be limited by SDK)
             maxtok: Maximum tokens
             maxthinktok: Maximum thinking tokens (for extended thinking)
@@ -294,7 +298,20 @@ class Client:
         if prefill:
             prompt = f"{prompt}\n\n[Start your response with: {prefill}]"
 
-        options = self._build_options(sp=sp, tools=tools, maxtok=maxtok, maxthinktok=maxthinktok, **kwargs)
+        options = self._build_options(
+            sp=sp, tools=tools, maxtok=maxtok, maxthinktok=maxthinktok,
+            stream=stream, **kwargs
+        )
+
+        # If streaming, return a StreamingResponse
+        if stream:
+            from .streaming import StreamingResponse
+            async_iter = sdk_query(prompt=prompt, options=options)
+            return StreamingResponse(
+                async_iter=async_iter,
+                prefill=prefill,
+                callback=cb
+            )
 
         collected_text = []
         final_message = None
@@ -303,16 +320,13 @@ class Client:
 
         try:
             async for msg in sdk_query(prompt=prompt, options=options):
-                # Check for ResultMessage which has usage and total_cost_usd
                 if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
-                    # Extract usage from ResultMessage (this is where usage actually is!)
                     if hasattr(msg, 'usage') and msg.usage:
                         total_usage = _parse_usage(msg.usage)
                     if hasattr(msg, 'total_cost_usd'):
                         total_cost_usd = msg.total_cost_usd
                     continue
 
-                # Process AssistantMessage for content only (usage is on ResultMessage)
                 if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
                     if hasattr(msg, 'content'):
                         final_message = _parse_sdk_message(msg)
@@ -320,26 +334,22 @@ class Client:
                             if hasattr(block, 'text'):
                                 collected_text.append(block.text)
                 elif hasattr(msg, 'content'):
-                    # Fallback for other message types with content
                     final_message = _parse_sdk_message(msg)
                     for block in msg.content:
                         if hasattr(block, 'text'):
                             collected_text.append(block.text)
 
         except Exception as e:
-            # If SDK call fails, return error message
             final_message = _simple_text_message(f"Error: {str(e)}")
 
         if final_message is None:
             final_message = _simple_text_message("".join(collected_text) if collected_text else "No response")
 
-        # Attach total usage to the final message
         if total_usage.total > 0:
             final_message.usage = total_usage
 
         result = self._log_request(final_message, prefill, msgs if isinstance(msgs, list) else [msgs], sp=sp)
 
-        # Store SDK-reported cost if available
         if total_cost_usd is not None:
             self._last_cost_usd = total_cost_usd
 

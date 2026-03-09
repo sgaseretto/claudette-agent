@@ -4,19 +4,22 @@ Chat module - Chat and AsyncChat classes with conversation history.
 This module provides a Claudette-compatible API using the Claude Agent SDK.
 Key differences from Claudette:
 - Tools require MCP server registration (handled automatically)
-- Streaming returns complete message blocks, not text chunks
 - Uses ClaudeSDKClient for tool support, query() for simple prompts
 """
 import asyncio
 import uuid
 import inspect
-from typing import Any, Dict, List, Optional, Union, Callable, get_type_hints, MutableMapping
+from typing import Any, Dict, List, Optional, Union, Callable, get_type_hints, MutableMapping, Literal
 
 from .core import (
     Usage, usage, Message, TextBlock, ToolUseBlock,
     contents, mk_msg, mk_msgs, mk_toolres, mk_toolres_async,
     get_schema, mk_tool_choice, listify, mk_ns, get_costs,
-    model_types, pricing, DEFAULT_MODEL, ToolLoopResult
+    model_types, pricing, DEFAULT_MODEL, ToolLoopResult,
+    _parse_usage, _parse_sdk_message, _simple_text_message,
+    AssistantMessage as SDKAssistantMessage,
+    ResultMessage as SDKResultMessage,
+    StreamEvent,
 )
 from .client import Client, AsyncClient
 
@@ -27,38 +30,10 @@ try:
         query as sdk_query,
         tool as sdk_tool,
         create_sdk_mcp_server,
-        AssistantMessage as SDKAssistantMessage,
-        ResultMessage as SDKResultMessage,
-        TextBlock as SDKTextBlock,
     )
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
-    SDKAssistantMessage = None
-    SDKResultMessage = None
-
-
-def _parse_usage(u):
-    """Parse usage from SDK message - handles both dict and object formats."""
-    if u is None:
-        return usage()
-
-    # SDK returns usage as a dict
-    if isinstance(u, dict):
-        return usage(
-            inp=u.get('input_tokens', 0),
-            out=u.get('output_tokens', 0),
-            cache_create=u.get('cache_creation_input_tokens', 0),
-            cache_read=u.get('cache_read_input_tokens', 0)
-        )
-
-    # Fall back to attribute access for compatibility
-    return usage(
-        inp=getattr(u, 'input_tokens', 0),
-        out=getattr(u, 'output_tokens', 0),
-        cache_create=getattr(u, 'cache_creation_input_tokens', 0),
-        cache_read=getattr(u, 'cache_read_input_tokens', 0)
-    )
 
 
 def nested_idx(lst: List, *indices) -> Any:
@@ -78,17 +53,19 @@ def _convert_to_sdk_tool(func: Callable) -> Any:
     """
     Convert a regular Python function to an SDK tool.
 
-    The SDK expects tools in a specific format created by @tool decorator.
+    Also accepts pre-created SdkMcpTool instances (pass-through).
     """
     if not SDK_AVAILABLE:
         raise ImportError("claude-agent-sdk is required")
 
-    # Get function metadata
+    # Pass through if already an SDK tool
+    if hasattr(func, 'name') and hasattr(func, 'handler'):
+        return func
+
     name = func.__name__
     doc = inspect.getdoc(func) or f"Function {name}"
-    description = doc.split("\n")[0]  # First line of docstring
+    description = doc.split("\n")[0]
 
-    # Build parameter schema from type hints
     hints = get_type_hints(func) if hasattr(func, '__annotations__') else {}
     sig = inspect.signature(func)
 
@@ -97,7 +74,6 @@ def _convert_to_sdk_tool(func: Callable) -> Any:
         if param_name in ('self', 'cls'):
             continue
         param_type = hints.get(param_name, str)
-        # Map Python types to simple types for SDK
         if param_type == int:
             params[param_name] = int
         elif param_type == float:
@@ -107,10 +83,8 @@ def _convert_to_sdk_tool(func: Callable) -> Any:
         else:
             params[param_name] = str
 
-    # Create the SDK tool wrapper
     @sdk_tool(name, description, params)
     async def sdk_wrapper(args):
-        # Call the original function with the args
         try:
             if asyncio.iscoroutinefunction(func):
                 result = await func(**args)
@@ -125,7 +99,6 @@ def _convert_to_sdk_tool(func: Callable) -> Any:
                 "is_error": True
             }
 
-    # Store reference to original function
     sdk_wrapper._original_func = func
     sdk_wrapper._tool_name = name
 
@@ -138,9 +111,6 @@ class Chat:
 
     Maintains a conversation history and supports tools, system prompts,
     and message streaming.
-
-    IMPORTANT: When using tools, the Chat class uses ClaudeSDKClient which
-    requires tools to be packaged as MCP servers. This is handled automatically.
 
     Example:
         >>> chat = Chat(model='claude-sonnet-4-5-20250929', sp="You are a helpful assistant")
@@ -173,32 +143,18 @@ class Chat:
         permission_mode: str = "default",
         setting_sources: List[str] = None,
         env: MutableMapping[str, str] = None,
-        extra_args: Dict[str, Any] = None
+        extra_args: Dict[str, Any] = None,
+        # New SDK features
+        max_turns: int = None,
+        max_budget_usd: float = None,
+        fallback_model: str = None,
+        can_use_tool: Callable = None,
+        hooks: Dict = None,
+        agents: Dict = None,
+        enable_file_checkpointing: bool = False,
+        thinking: Any = None,
+        effort: Literal["low", "medium", "high", "max"] = None,
     ):
-        """
-        Initialize the Chat.
-
-        Args:
-            model: Model to use (leave empty if passing `cli`)
-            cli: Client to use (leave empty if passing `model`)
-            sp: Optional system prompt
-            tools: List of tools to make available to Claude
-            temp: Temperature
-            cont_pr: User prompt to continue an assistant response
-            cache: Use Claude cache?
-            hist: Initialize history
-            ns: Namespace to search for tools
-            cwd: Working directory for operations
-            allowed_tools: List of allowed SDK tools
-            permission_mode: Permission mode for tools
-            setting_sources: List of setting sources to load ('user', 'project', 'local').
-                           Default [] = stateless (no settings loaded). Use ['user', 'project', 'local']
-                           for session persistence.
-            env: Environment variables to pass to the Claude CLI process. Useful for
-                 setting HOME to a temp directory for true stateless queries.
-            extra_args: Additional arguments to pass to ClaudeAgentOptions. Useful for
-                       flags like no_session_persistence=True for truly stateless queries.
-        """
         if not SDK_AVAILABLE:
             raise ImportError(
                 "claude-agent-sdk is not installed. "
@@ -208,7 +164,6 @@ class Chat:
         assert model or cli, "Must provide either model or cli"
         assert cont_pr != "", "cont_pr may not be an empty string"
 
-        # If Client provided, optionally update setting_sources, env, and extra_args
         if cli is not None:
             self.c = cli
             if setting_sources is not None:
@@ -226,20 +181,29 @@ class Chat:
                 permission_mode=permission_mode,
                 setting_sources=setting_sources if setting_sources is not None else [],
                 env=env,
-                extra_args=extra_args
+                extra_args=extra_args,
+                max_turns=max_turns,
+                max_budget_usd=max_budget_usd,
+                fallback_model=fallback_model,
+                can_use_tool=can_use_tool,
+                hooks=hooks,
+                agents=agents,
+                enable_file_checkpointing=enable_file_checkpointing,
+                thinking=thinking,
+                effort=effort,
             )
 
         if hist is None:
             hist = []
 
-        self.h = hist  # Conversation history
-        self.sp = sp  # System prompt
+        self.h = hist
+        self.sp = sp
         self.cont_pr = cont_pr
         self.temp = temp
         self.cache = cache
-        self.last: List[Dict] = []  # Last response messages
+        self.last: List[Dict] = []
 
-        # Process tools - convert to SDK format and create MCP server
+        # Process tools
         self._original_tools = listify(tools) if tools else []
         self._sdk_tools = []
         self._mcp_server = None
@@ -248,24 +212,20 @@ class Chat:
         if self._original_tools:
             self._setup_tools()
 
-        # Create namespace for tool results
         if ns is None:
-            ns = {t.__name__: t for t in self._original_tools} if self._original_tools else {}
+            ns = {t.__name__: t for t in self._original_tools if callable(t)} if self._original_tools else {}
         self.ns = ns
 
     def _setup_tools(self):
         """Set up tools as an MCP server for the SDK."""
-        # Convert each tool to SDK format
         for func in self._original_tools:
             if callable(func):
                 sdk_t = _convert_to_sdk_tool(func)
                 self._sdk_tools.append(sdk_t)
-                # Add to allowed tools list
-                tool_name = f"mcp__tools__{func.__name__}"
+                tool_name = f"mcp__tools__{getattr(func, '__name__', getattr(func, 'name', 'unknown'))}"
                 if tool_name not in self._allowed_tools:
                     self._allowed_tools.append(tool_name)
 
-        # Create MCP server with all tools
         if self._sdk_tools:
             self._mcp_server = create_sdk_mcp_server(
                 name="tools",
@@ -280,17 +240,14 @@ class Chat:
 
     @property
     def use(self) -> Usage:
-        """Get usage statistics."""
         return self.c.use
 
     @property
     def cost(self) -> float:
-        """Get total cost."""
         return self.c.cost
 
     @property
     def model(self) -> str:
-        """Get model name."""
         return self.c.model
 
     def _post_pr(self, pr: Any, prev_role: str) -> None:
@@ -308,38 +265,85 @@ class Chat:
         prev_role = nested_idx(self.h, -1, 'role') if self.h else 'assistant'
         self._post_pr(pr, prev_role)
 
-    def _build_options(self, maxthinktok: int = 0, **kwargs) -> 'ClaudeAgentOptions':
+    def _build_options(self, maxthinktok: int = 0, stream: bool = False, **kwargs) -> 'ClaudeAgentOptions':
         """Build ClaudeAgentOptions for the SDK call."""
+        # System prompt: support string or dict (preset)
+        if isinstance(self.sp, dict):
+            system_prompt = self.sp
+        else:
+            system_prompt = self.sp or "You are a helpful assistant."
+
         opts = {
-            'system_prompt': self.sp or "You are a helpful assistant.",
+            'system_prompt': system_prompt,
             'setting_sources': self.c.setting_sources,
-            'continue_conversation': False,  # Ensure stateless - don't continue most recent conversation
-            'resume': None,  # Ensure stateless - don't resume any previous session
+            'continue_conversation': False,
+            'resume': None,
         }
 
-        if kwargs.get('max_turns'):
-            opts['max_turns'] = kwargs['max_turns']
+        if kwargs.get('max_turns') or self.c.max_turns:
+            opts['max_turns'] = kwargs.get('max_turns') or self.c.max_turns
 
         if self.c.cwd:
             opts['cwd'] = self.c.cwd
 
-        # Add MCP server if we have tools
         if self._mcp_server:
             opts['mcp_servers'] = {"tools": self._mcp_server}
 
-        # Add allowed tools
         if self._allowed_tools:
             opts['allowed_tools'] = self._allowed_tools
 
-        # Merge environment variables from client instance
+        # Environment variables
         if self.c.env:
             opts['env'] = opts.get('env', {})
             opts['env'].update(self.c.env)
 
-        # Enable extended thinking via environment variable
+        # Extended thinking via native SDK support
         if maxthinktok and maxthinktok > 0:
-            opts['env'] = opts.get('env', {})
-            opts['env']['MAX_THINKING_TOKENS'] = str(maxthinktok)
+            if stream:
+                raise ValueError(
+                    "Streaming is incompatible with extended thinking in the Claude Agent SDK. "
+                    "Use stream=False when using maxthinktok, or set maxthinktok=0 for streaming."
+                )
+            from .client import _has_option
+            if _has_option('thinking'):
+                opts['thinking'] = {"type": "enabled", "budget_tokens": maxthinktok}
+            else:
+                opts['max_thinking_tokens'] = maxthinktok
+        elif self.c.thinking:
+            from .client import _has_option
+            if _has_option('thinking'):
+                opts['thinking'] = self.c.thinking
+            elif isinstance(self.c.thinking, dict) and self.c.thinking.get('type') == 'enabled':
+                opts['max_thinking_tokens'] = self.c.thinking.get('budget_tokens', 0)
+
+        # Effort level (if SDK supports it)
+        if self.c.effort:
+            from .client import _has_option
+            if _has_option('effort'):
+                opts['effort'] = self.c.effort
+
+        # Streaming: enable partial messages
+        if stream:
+            opts['include_partial_messages'] = True
+
+        # New SDK features from client
+        if self.c.max_budget_usd is not None:
+            opts['max_budget_usd'] = self.c.max_budget_usd
+        if self.c.fallback_model:
+            opts['fallback_model'] = self.c.fallback_model
+        if self.c.can_use_tool:
+            opts['can_use_tool'] = self.c.can_use_tool
+        if self.c.hooks:
+            opts['hooks'] = self.c.hooks
+        if self.c.agents:
+            opts['agents'] = self.c.agents
+        if self.c.enable_file_checkpointing:
+            opts['enable_file_checkpointing'] = True
+
+        # Extra args
+        if self.c.extra_args:
+            opts['extra_args'] = opts.get('extra_args', {})
+            opts['extra_args'].update(self.c.extra_args)
 
         return ClaudeAgentOptions(**opts)
 
@@ -369,39 +373,6 @@ class Chat:
 
         return "\n\n".join(parts)
 
-    def _parse_sdk_message(self, msg: Any) -> Message:
-        """Convert SDK message to our Message format."""
-        content_blocks = []
-        msg_usage = usage()
-
-        if hasattr(msg, 'content'):
-            for block in msg.content:
-                if hasattr(block, 'text'):
-                    content_blocks.append(TextBlock(text=block.text))
-                elif hasattr(block, 'type'):
-                    if block.type == 'text':
-                        content_blocks.append(TextBlock(text=getattr(block, 'text', '')))
-                    elif block.type == 'tool_use':
-                        content_blocks.append(ToolUseBlock(
-                            id=getattr(block, 'id', ''),
-                            name=getattr(block, 'name', ''),
-                            input=getattr(block, 'input', {})
-                        ))
-
-        # Parse usage - SDK returns it as a dict
-        if hasattr(msg, 'usage') and msg.usage:
-            msg_usage = _parse_usage(msg.usage)
-
-        return Message(
-            id=getattr(msg, 'id', str(uuid.uuid4())),
-            role=getattr(msg, 'role', 'assistant'),
-            content=content_blocks,
-            model=getattr(msg, 'model', ''),
-            stop_reason=getattr(msg, 'stop_reason', None),
-            stop_sequence=getattr(msg, 'stop_sequence', None),
-            usage=msg_usage
-        )
-
     async def _call_with_tools(
         self,
         conversation_text: str,
@@ -418,46 +389,31 @@ class Chat:
                 await client.query(conversation_text)
 
                 async for msg in client.receive_response():
-                    # Check for ResultMessage which has usage and total_cost_usd
                     if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
-                        # Extract usage from ResultMessage (this is where usage actually is!)
                         if hasattr(msg, 'usage') and msg.usage:
                             total_usage = _parse_usage(msg.usage)
                         if hasattr(msg, 'total_cost_usd'):
                             self.c._last_cost_usd = msg.total_cost_usd
                         continue
 
-                    # Process AssistantMessage for content only (usage is on ResultMessage)
                     if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
                         if hasattr(msg, 'content'):
-                            final_message = self._parse_sdk_message(msg)
+                            final_message = _parse_sdk_message(msg)
                             for block in msg.content:
                                 if hasattr(block, 'text'):
                                     collected_text.append(block.text)
                     elif hasattr(msg, 'content'):
-                        # Fallback for other message types
-                        final_message = self._parse_sdk_message(msg)
+                        final_message = _parse_sdk_message(msg)
                         for block in msg.content:
                             if hasattr(block, 'text'):
                                 collected_text.append(block.text)
 
         except Exception as e:
-            final_message = Message(
-                id=str(uuid.uuid4()),
-                role='assistant',
-                content=[TextBlock(text=f"Error: {str(e)}")],
-                usage=usage()
-            )
+            final_message = _simple_text_message(f"Error: {str(e)}")
 
         if final_message is None:
-            final_message = Message(
-                id=str(uuid.uuid4()),
-                role='assistant',
-                content=[TextBlock(text="".join(collected_text) if collected_text else "No response")],
-                usage=usage()
-            )
+            final_message = _simple_text_message("".join(collected_text) if collected_text else "No response")
 
-        # Attach total usage to the final message
         if total_usage.total > 0:
             final_message.usage = total_usage
 
@@ -476,46 +432,31 @@ class Chat:
 
         try:
             async for msg in sdk_query(prompt=conversation_text, options=options):
-                # Check for ResultMessage which has usage and total_cost_usd
                 if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
-                    # Extract usage from ResultMessage (this is where usage actually is!)
                     if hasattr(msg, 'usage') and msg.usage:
                         total_usage = _parse_usage(msg.usage)
                     if hasattr(msg, 'total_cost_usd'):
                         self.c._last_cost_usd = msg.total_cost_usd
                     continue
 
-                # Process AssistantMessage for content only (usage is on ResultMessage)
                 if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
                     if hasattr(msg, 'content'):
-                        final_message = self._parse_sdk_message(msg)
+                        final_message = _parse_sdk_message(msg)
                         for block in msg.content:
                             if hasattr(block, 'text'):
                                 collected_text.append(block.text)
                 elif hasattr(msg, 'content'):
-                    # Fallback for other message types
-                    final_message = self._parse_sdk_message(msg)
+                    final_message = _parse_sdk_message(msg)
                     for block in msg.content:
                         if hasattr(block, 'text'):
                             collected_text.append(block.text)
 
         except Exception as e:
-            final_message = Message(
-                id=str(uuid.uuid4()),
-                role='assistant',
-                content=[TextBlock(text=f"Error: {str(e)}")],
-                usage=usage()
-            )
+            final_message = _simple_text_message(f"Error: {str(e)}")
 
         if final_message is None:
-            final_message = Message(
-                id=str(uuid.uuid4()),
-                role='assistant',
-                content=[TextBlock(text="".join(collected_text) if collected_text else "No response")],
-                usage=usage()
-            )
+            final_message = _simple_text_message("".join(collected_text) if collected_text else "No response")
 
-        # Attach total usage to the final message
         if total_usage.total > 0:
             final_message.usage = total_usage
 
@@ -535,15 +476,12 @@ class Chat:
         if temp is None:
             temp = self.temp
 
-        # Build the full conversation context
         conversation_text = self._build_conversation_prompt()
 
-        # Add prefill instruction if provided
         if prefill:
             conversation_text = f"{conversation_text}\n\n[Start your response with: {prefill}]"
 
-        # Build options with extended thinking support
-        options = self._build_options(maxthinktok=maxthinktok, **kw)
+        options = self._build_options(maxthinktok=maxthinktok, stream=stream, **kw)
 
         # Use ClaudeSDKClient if we have tools, otherwise use query()
         if self._mcp_server:
@@ -551,10 +489,8 @@ class Chat:
         else:
             final_message = await self._call_simple(conversation_text, options, **kw)
 
-        # Update client state
         self.c._r(final_message, prefill)
 
-        # Create tool results and update history
         self.last = mk_toolres(final_message, ns=self.ns)
         self.h.extend(self.last)
 
@@ -570,7 +506,7 @@ class Chat:
         prefill: str = '',
         tool_choice: Optional[Union[str, bool, Dict]] = None,
         **kw
-    ) -> Message:
+    ):
         """
         Send a message and get a response.
 
@@ -579,29 +515,57 @@ class Chat:
             temp: Temperature
             maxtok: Maximum tokens
             maxthinktok: Maximum thinking tokens
-            stream: Stream response? (Note: SDK streams messages, not text chunks)
+            stream: Stream response (yields text chunks via StreamEvent)
             prefill: Optional prefill to pass to Claude as start of its response
             tool_choice: Optionally force use of some tool
 
         Returns:
-            Message object with Claude's response
+            Message object (or StreamingResponse if stream=True)
         """
         if temp is None:
             temp = self.temp
 
-        # Handle history append
         prev_role = nested_idx(self.h, -1, 'role') if self.h else 'assistant'
         if pr and prev_role == 'user':
-            # Already have a user request pending, run it first
             await self._call_impl(temp=temp, maxtok=maxtok, maxthinktok=maxthinktok,
-                                  stream=stream, prefill=prefill, tool_choice=tool_choice, **kw)
+                                  stream=False, prefill=prefill, tool_choice=tool_choice, **kw)
         self._post_pr(pr, prev_role)
+
+        # For streaming, build options and return StreamingResponse
+        if stream:
+            from .streaming import StreamingResponse
+            conversation_text = self._build_conversation_prompt()
+            if prefill:
+                conversation_text = f"{conversation_text}\n\n[Start your response with: {prefill}]"
+            options = self._build_options(maxthinktok=maxthinktok, stream=True, **kw)
+
+            if self._mcp_server:
+                # Streaming with tools via ClaudeSDKClient
+                async def _stream_with_tools():
+                    async with ClaudeSDKClient(options=options) as client:
+                        await client.query(conversation_text)
+                        async for msg in client.receive_response():
+                            yield msg
+                async_iter = _stream_with_tools()
+            else:
+                async_iter = sdk_query(prompt=conversation_text, options=options)
+
+            def _on_stream_done(final_msg):
+                """Callback to update history after streaming completes."""
+                self.c._r(final_msg, prefill='')
+                self.h.append(mk_msg(contents(final_msg), role="assistant"))
+
+            return StreamingResponse(
+                async_iter=async_iter,
+                prefill='',
+                callback=_on_stream_done
+            )
 
         return await self._call_impl(
             temp=temp,
             maxtok=maxtok,
             maxthinktok=maxthinktok,
-            stream=stream,
+            stream=False,
             prefill=prefill,
             tool_choice=tool_choice,
             **kw
@@ -618,10 +582,6 @@ class Chat:
         """
         Add prompt and get response, automatically following up with tool_use messages.
 
-        Note: With the Claude Agent SDK, tool execution is handled automatically
-        by ClaudeSDKClient. This method provides compatibility with Claudette's API
-        but the SDK manages the tool loop internally.
-
         Args:
             pr: Prompt to pass to Claude
             max_steps: Maximum number of tool requests to loop through
@@ -630,18 +590,10 @@ class Chat:
 
         Returns:
             ToolLoopResult with iterable messages and .value for final result
-
-        Example:
-            >>> results = await chat.toolloop("Research Python async programming")
-            >>> for result in results:
-            ...     print(contents(result))
-            >>> final = results.value  # Get final response
         """
         results = ToolLoopResult([])
         init_n = len(self.h)
 
-        # With SDK, the tool loop is handled internally
-        # We set max_turns to allow multiple tool calls
         kwargs['max_turns'] = max_steps
 
         r = await self(pr, **kwargs)
@@ -650,8 +602,6 @@ class Chat:
         if len(self.last) > 1:
             results.append(self.last[1])
 
-        # The SDK handles additional tool calls internally
-        # But we can still check for tool_use stop reason for compatibility
         for i in range(max_steps - 1):
             if self.c.stop_reason != 'tool_use':
                 break
@@ -677,96 +627,103 @@ class Chat:
         **kwargs
     ):
         """
-        Get a response from Claude, yielding message blocks as they arrive.
+        Get a streaming response from Claude, yielding text chunks as they arrive.
 
-        IMPORTANT: The Claude Agent SDK streams complete message blocks, not
-        individual text characters like the Anthropic API. Each yield is a
-        complete text block from a message.
+        Uses include_partial_messages=True for character-level streaming via StreamEvent.
 
         Args:
             pr: Prompt / message
             temp: Temperature
             maxtok: Maximum tokens
-            maxthinktok: Maximum thinking tokens for extended thinking
-            **kwargs: Additional options
+            maxthinktok: Maximum thinking tokens
 
         Yields:
-            Text content from each message block as it arrives
-
-        Example:
-            >>> async for text in chat.stream("Tell me a story"):
-            ...     print(text)  # Each 'text' is a complete message block
+            Text content chunks as they arrive (character-level with StreamEvent)
         """
         if temp is None:
             temp = self.temp
 
-        # Add prompt to history
         self._append_pr(pr)
 
-        # Build the conversation context
         conversation_text = self._build_conversation_prompt()
 
-        # Build options with extended thinking support
-        options = self._build_options(maxthinktok=maxthinktok, **kwargs)
+        options = self._build_options(maxthinktok=maxthinktok, stream=True, **kwargs)
 
         collected_text = []
         total_usage = usage()
 
-        # Use appropriate method based on whether we have tools
         if self._mcp_server:
             async with ClaudeSDKClient(options=options) as client:
                 await client.query(conversation_text)
                 async for msg in client.receive_response():
-                    # Check for ResultMessage which has usage and total_cost_usd
+                    # StreamEvent for char-by-char streaming
+                    if StreamEvent is not None and isinstance(msg, StreamEvent):
+                        event = msg.event
+                        if event.get('type') == 'content_block_delta':
+                            delta = event.get('delta', {})
+                            if delta.get('type') == 'text_delta':
+                                text = delta.get('text', '')
+                                if text:
+                                    collected_text.append(text)
+                                    yield text
+                        continue
+
                     if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
-                        # Extract usage from ResultMessage (this is where usage actually is!)
                         if hasattr(msg, 'usage') and msg.usage:
                             total_usage = _parse_usage(msg.usage)
                         if hasattr(msg, 'total_cost_usd'):
                             self.c._last_cost_usd = msg.total_cost_usd
                         continue
 
-                    # Process AssistantMessage for content only (usage is on ResultMessage)
+                    # Fallback: complete AssistantMessage blocks
                     if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
-                        if hasattr(msg, 'content'):
+                        if hasattr(msg, 'content') and not collected_text:
                             for block in msg.content:
                                 if hasattr(block, 'text'):
                                     collected_text.append(block.text)
                                     yield block.text
-                    elif hasattr(msg, 'content'):
+                    elif hasattr(msg, 'content') and not collected_text:
                         for block in msg.content:
                             if hasattr(block, 'text'):
                                 collected_text.append(block.text)
                                 yield block.text
         else:
             async for msg in sdk_query(prompt=conversation_text, options=options):
-                # Check for ResultMessage which has usage and total_cost_usd
+                # StreamEvent for char-by-char streaming
+                if StreamEvent is not None and isinstance(msg, StreamEvent):
+                    event = msg.event
+                    if event.get('type') == 'content_block_delta':
+                        delta = event.get('delta', {})
+                        if delta.get('type') == 'text_delta':
+                            text = delta.get('text', '')
+                            if text:
+                                collected_text.append(text)
+                                yield text
+                    continue
+
                 if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
-                    # Extract usage from ResultMessage (this is where usage actually is!)
                     if hasattr(msg, 'usage') and msg.usage:
                         total_usage = _parse_usage(msg.usage)
                     if hasattr(msg, 'total_cost_usd'):
                         self.c._last_cost_usd = msg.total_cost_usd
                     continue
 
-                # Process AssistantMessage for content only (usage is on ResultMessage)
+                # Fallback: complete AssistantMessage blocks
                 if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
-                    if hasattr(msg, 'content'):
+                    if hasattr(msg, 'content') and not collected_text:
                         for block in msg.content:
                             if hasattr(block, 'text'):
                                 collected_text.append(block.text)
                                 yield block.text
-                elif hasattr(msg, 'content'):
+                elif hasattr(msg, 'content') and not collected_text:
                     for block in msg.content:
                         if hasattr(block, 'text'):
                             collected_text.append(block.text)
                             yield block.text
 
-        # Update usage on client
         if total_usage.total > 0:
             self.c.use = self.c.use + total_usage
 
-        # Update history with the full response
         full_response = "".join(collected_text)
         self.h.append(mk_msg(full_response, role="assistant"))
 
@@ -820,23 +777,20 @@ class AsyncChat(Chat):
         setting_sources: List[str] = None,
         **kwargs
     ):
-        """
-        Initialize the AsyncChat.
-
-        Args:
-            model: Model to use (leave empty if passing `cli`)
-            cli: Client to use (leave empty if passing `model`)
-            setting_sources: List of setting sources to load ('user', 'project', 'local').
-                           Default [] = stateless (no settings loaded). Use ['user', 'project', 'local']
-                           for session persistence.
-            **kwargs: Additional arguments passed to Chat
-        """
         super().__init__(model, cli, setting_sources=setting_sources, **kwargs)
         if not cli:
-            self.c = AsyncClient(model or DEFAULT_MODEL, **{
+            # Build kwargs for AsyncClient
+            client_kwargs = {
                 k: v for k, v in kwargs.items()
-                if k in ('cache', 'cwd', 'allowed_tools', 'permission_mode', 'env', 'extra_args')
-            }, setting_sources=setting_sources if setting_sources is not None else [])
+                if k in ('cache', 'cwd', 'allowed_tools', 'permission_mode', 'env', 'extra_args',
+                         'max_turns', 'max_budget_usd', 'fallback_model', 'can_use_tool',
+                         'hooks', 'agents', 'enable_file_checkpointing', 'thinking', 'effort')
+            }
+            self.c = AsyncClient(
+                model or DEFAULT_MODEL,
+                setting_sources=setting_sources if setting_sources is not None else [],
+                **client_kwargs
+            )
 
     async def _append_pr(self, pr: Any = None) -> None:
         """Append prompt to history (async version)."""
@@ -885,19 +839,12 @@ class AsyncChat(Chat):
         """
         Add prompt and get response, automatically following up with tool_use messages (async).
 
-        Args:
-            pr: Prompt to pass to Claude
-            max_steps: Maximum number of tool requests to loop through
-            cont_func: Function that stops loop if returns False
-            final_prompt: Prompt to add if last message is a tool call
-
         Returns:
             ToolLoopResult with iterable messages and .value for final result
         """
         results = ToolLoopResult([])
         init_n = len(self.h)
 
-        # With SDK, set max_turns for tool handling
         kwargs['max_turns'] = max_steps
 
         r = await self(pr, **kwargs)

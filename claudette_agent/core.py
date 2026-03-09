@@ -20,6 +20,7 @@ try:
         create_sdk_mcp_server,
         AssistantMessage,
         UserMessage,
+        ResultMessage,
         TextBlock as SDKTextBlock,
         ToolUseBlock as SDKToolUseBlock,
         ToolResultBlock as SDKToolResultBlock,
@@ -27,6 +28,13 @@ try:
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
+    AssistantMessage = None
+    ResultMessage = None
+
+try:
+    from claude_agent_sdk.types import StreamEvent
+except ImportError:
+    StreamEvent = None
 
 # Type variable for generic operations
 T = TypeVar('T')
@@ -748,6 +756,74 @@ class ToolLoopResult:
     def append(self, item):
         """Append an item to results."""
         self._results.append(item)
+
+
+def _parse_usage(u: Any) -> 'Usage':
+    """Parse usage from SDK message - handles both dict and object formats."""
+    if u is None:
+        return usage()
+
+    if isinstance(u, dict):
+        return usage(
+            inp=u.get('input_tokens', 0),
+            out=u.get('output_tokens', 0),
+            cache_create=u.get('cache_creation_input_tokens', 0),
+            cache_read=u.get('cache_read_input_tokens', 0)
+        )
+
+    return usage(
+        inp=getattr(u, 'input_tokens', 0),
+        out=getattr(u, 'output_tokens', 0),
+        cache_create=getattr(u, 'cache_creation_input_tokens', 0),
+        cache_read=getattr(u, 'cache_read_input_tokens', 0)
+    )
+
+
+def _parse_sdk_message(msg: Any) -> 'Message':
+    """Convert SDK AssistantMessage to our Message format."""
+    import uuid as _uuid
+    content_blocks = []
+    msg_usage = usage()
+
+    if hasattr(msg, 'content'):
+        for block in msg.content:
+            if hasattr(block, 'type'):
+                if block.type == 'text':
+                    content_blocks.append(TextBlock(text=getattr(block, 'text', '')))
+                elif block.type == 'tool_use':
+                    content_blocks.append(ToolUseBlock(
+                        id=getattr(block, 'id', ''),
+                        name=getattr(block, 'name', ''),
+                        input=getattr(block, 'input', {})
+                    ))
+                elif block.type == 'thinking':
+                    content_blocks.append(ThinkingBlock(thinking=getattr(block, 'thinking', '')))
+            elif hasattr(block, 'text'):
+                content_blocks.append(TextBlock(text=block.text))
+
+    if hasattr(msg, 'usage') and msg.usage:
+        msg_usage = _parse_usage(msg.usage)
+
+    return Message(
+        id=getattr(msg, 'id', str(_uuid.uuid4())),
+        role=getattr(msg, 'role', 'assistant'),
+        content=content_blocks,
+        model=getattr(msg, 'model', ''),
+        stop_reason=getattr(msg, 'stop_reason', None),
+        stop_sequence=getattr(msg, 'stop_sequence', None),
+        usage=msg_usage
+    )
+
+
+def _simple_text_message(text: str) -> 'Message':
+    """Create a simple text message."""
+    import uuid as _uuid
+    return Message(
+        id=str(_uuid.uuid4()),
+        role='assistant',
+        content=[TextBlock(text=text)],
+        usage=usage()
+    )
 
 
 def get_costs(c: 'Client') -> tuple:
