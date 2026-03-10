@@ -145,6 +145,13 @@ from .text_editor import (
     text_editor_conf,
 )
 
+# Session management (re-export from SDK)
+try:
+    from claude_agent_sdk import list_sessions, get_session_messages
+except ImportError:
+    list_sessions = None
+    get_session_messages = None
+
 # Apply mixins to classes
 add_struct_to_client(Client)
 add_struct_to_client(AsyncClient)
@@ -251,6 +258,10 @@ __all__ = [
     'str_replace_based_edit_tool',
     'get_text_editor_schema',
     'text_editor_conf',
+
+    # Session management
+    'list_sessions',
+    'get_session_messages',
 ]
 
 

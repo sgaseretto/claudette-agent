@@ -1,22 +1,35 @@
 """
 Streaming module - Support for streaming responses from Claude.
+
+Uses the SDK's include_partial_messages=True to receive StreamEvent objects
+with text_delta for real character-by-character streaming.
 """
 import asyncio
 from typing import Any, AsyncIterator, Iterator, Callable, Optional, List, Union
 
-from .core import Message, TextBlock, usage, contents
+from .core import (
+    Message, TextBlock, usage, contents, _parse_usage,
+    AssistantMessage as SDKAssistantMessage,
+    ResultMessage as SDKResultMessage,
+    StreamEvent,
+)
 
 
 class StreamingResponse:
     """
     A streaming response that yields text chunks as they arrive.
 
-    This class wraps the async iterator from the SDK and provides
-    both sync and async interfaces.
+    When include_partial_messages=True is set in SDK options, the SDK yields
+    StreamEvent objects containing raw Claude API events. This class processes
+    those events to yield individual text chunks (character-level streaming).
+
+    After iteration completes, access the final message via `.value`.
 
     Example:
-        >>> async for chunk in client.stream("Tell me a story"):
+        >>> stream = await client("Tell me a story", stream=True)
+        >>> async for chunk in stream:
         ...     print(chunk, end="", flush=True)
+        >>> final_msg = stream.value
     """
 
     def __init__(
@@ -25,44 +38,56 @@ class StreamingResponse:
         prefill: str = "",
         callback: Optional[Callable] = None
     ):
-        """
-        Initialize the streaming response.
-
-        Args:
-            async_iter: The async iterator from the SDK
-            prefill: Optional prefill text to prepend
-            callback: Optional callback for when streaming completes
-        """
         self._async_iter = async_iter
         self._prefill = prefill
         self._callback = callback
         self._collected_text: List[str] = []
-        self._final_message: Optional[Message] = None
-        self._started = False
+        self._result_message = None  # SDK ResultMessage
+        self._assistant_message = None  # SDK AssistantMessage
+        self.value: Optional[Message] = None
 
     async def __aiter__(self) -> AsyncIterator[str]:
-        """Async iteration over text chunks."""
+        """Async iteration over text chunks from StreamEvent deltas."""
         if self._prefill:
             self._collected_text.append(self._prefill)
             yield self._prefill
 
         async for item in self._async_iter:
-            if hasattr(item, 'content'):
-                for block in item.content:
-                    if hasattr(block, 'text'):
-                        text = block.text
-                        self._collected_text.append(text)
-                        yield text
-            elif isinstance(item, str):
-                self._collected_text.append(item)
-                yield item
+            # Process StreamEvent for character-level streaming
+            if StreamEvent is not None and isinstance(item, StreamEvent):
+                event = item.event
+                if event.get('type') == 'content_block_delta':
+                    delta = event.get('delta', {})
+                    if delta.get('type') == 'text_delta':
+                        text = delta.get('text', '')
+                        if text:
+                            self._collected_text.append(text)
+                            yield text
 
-        # Store final message if available
-        if hasattr(self._async_iter, 'value'):
-            self._final_message = self._async_iter.value
+            # Capture final AssistantMessage (complete message with all content)
+            elif SDKAssistantMessage is not None and isinstance(item, SDKAssistantMessage):
+                self._assistant_message = item
+                # If we didn't get StreamEvents (fallback), yield block text
+                if not self._collected_text:
+                    if hasattr(item, 'content'):
+                        for block in item.content:
+                            if hasattr(block, 'text'):
+                                text = block.text
+                                self._collected_text.append(text)
+                                yield text
+
+            # Capture ResultMessage for usage info
+            elif SDKResultMessage is not None and isinstance(item, SDKResultMessage):
+                self._result_message = item
+
+        # Build final message
+        self.value = self._build_final_message()
 
         if self._callback:
-            await self._callback(self.get_final_message())
+            if asyncio.iscoroutinefunction(self._callback):
+                await self._callback(self.value)
+            else:
+                self._callback(self.value)
 
     def __iter__(self) -> Iterator[str]:
         """Sync iteration (uses event loop)."""
@@ -77,16 +102,35 @@ class StreamingResponse:
         chunks = loop.run_until_complete(collect())
         yield from chunks
 
-    def get_final_message(self) -> Message:
-        """Get the final accumulated message."""
-        if self._final_message:
-            return self._final_message
+    def _build_final_message(self) -> Message:
+        """Build the final Message from collected data."""
+        from .core import _parse_sdk_message
 
+        msg_usage = usage()
+
+        # Extract usage from ResultMessage
+        if self._result_message and hasattr(self._result_message, 'usage') and self._result_message.usage:
+            msg_usage = _parse_usage(self._result_message.usage)
+
+        # If we have a full AssistantMessage, parse it properly
+        if self._assistant_message:
+            result = _parse_sdk_message(self._assistant_message)
+            if msg_usage.total > 0:
+                result.usage = msg_usage
+            return result
+
+        # Fallback: build from collected text
         return Message(
             role='assistant',
             content=[TextBlock(text=''.join(self._collected_text))],
-            usage=usage()
+            usage=msg_usage
         )
+
+    def get_final_message(self) -> Message:
+        """Get the final accumulated message."""
+        if self.value:
+            return self.value
+        return self._build_final_message()
 
     @property
     def text(self) -> str:
@@ -98,11 +142,7 @@ class StreamingResponse:
 
 
 class StreamingMixin:
-    """
-    Mixin class that adds streaming support to Client/Chat classes.
-
-    This mixin adds the `stream` method for getting streamed responses.
-    """
+    """Mixin class that adds streaming support to Client/Chat classes."""
 
     async def stream(
         self,
@@ -116,37 +156,34 @@ class StreamingMixin:
         """
         Stream a response from Claude.
 
-        Args:
-            msgs: Messages or prompt to send
-            sp: System prompt
-            temp: Temperature
-            maxtok: Maximum tokens
-            prefill: Prefill text
-
         Returns:
-            StreamingResponse that can be iterated
+            StreamingResponse that yields text chunks via async iteration.
+            Access .value after iteration for the final Message.
         """
         try:
             from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
         except ImportError:
             raise ImportError("claude-agent-sdk is required for streaming")
 
-        # Build prompt
         if isinstance(msgs, str):
             prompt = msgs
         else:
             prompt = self._build_prompt_from_msgs(msgs)
 
-        # Build options
+        # System prompt: support string or dict
+        if isinstance(sp, dict):
+            system_prompt = sp
+        else:
+            system_prompt = sp or getattr(self, 'sp', '') or "You are a helpful assistant."
+
         options = ClaudeAgentOptions(
-            system_prompt=sp or getattr(self, 'sp', '') or "You are a helpful assistant.",
+            system_prompt=system_prompt,
             max_turns=kwargs.get('max_turns', 1),
+            include_partial_messages=True,
         )
 
-        # Get the async iterator
         async_iter = sdk_query(prompt=prompt, options=options)
 
-        # Wrap in StreamingResponse
         return StreamingResponse(
             async_iter=async_iter,
             prefill=prefill,
@@ -178,13 +215,8 @@ async def stream_text(
     """
     Simple function to stream text from Claude.
 
-    Args:
-        prompt: The prompt to send
-        system_prompt: System prompt
-        **kwargs: Additional options
-
     Yields:
-        Text chunks as they arrive
+        Text chunks as they arrive (character-level when SDK supports it)
     """
     try:
         from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
@@ -194,13 +226,26 @@ async def stream_text(
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         max_turns=kwargs.get('max_turns', 1),
+        include_partial_messages=True,
     )
 
+    got_stream_events = False
     async for msg in sdk_query(prompt=prompt, options=options):
-        if hasattr(msg, 'content'):
-            for block in msg.content:
-                if hasattr(block, 'text'):
-                    yield block.text
+        if StreamEvent is not None and isinstance(msg, StreamEvent):
+            event = msg.event
+            if event.get('type') == 'content_block_delta':
+                delta = event.get('delta', {})
+                if delta.get('type') == 'text_delta':
+                    text = delta.get('text', '')
+                    if text:
+                        got_stream_events = True
+                        yield text
+        elif SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
+            # Only yield from AssistantMessage if we didn't get StreamEvents (fallback)
+            if not got_stream_events and hasattr(msg, 'content'):
+                for block in msg.content:
+                    if hasattr(block, 'text'):
+                        yield block.text
 
 
 def stream_text_sync(
@@ -208,17 +253,7 @@ def stream_text_sync(
     system_prompt: str = "You are a helpful assistant.",
     **kwargs
 ) -> Iterator[str]:
-    """
-    Synchronous wrapper for streaming text.
-
-    Args:
-        prompt: The prompt to send
-        system_prompt: System prompt
-        **kwargs: Additional options
-
-    Yields:
-        Text chunks
-    """
+    """Synchronous wrapper for streaming text."""
     loop = asyncio.get_event_loop()
 
     async def collect():
@@ -233,10 +268,9 @@ def stream_text_sync(
 
 class TextStream:
     """
-    A text stream that collects chunks and provides the final message.
+    A text stream that collects chunks and provides the final message via .value.
 
-    This mimics the claudette text stream behavior where you can iterate
-    over chunks and then access the final message via `.value`.
+    This mimics the claudette text stream behavior.
 
     Example:
         >>> stream = TextStream(client.stream("Hello"))
@@ -246,18 +280,15 @@ class TextStream:
     """
 
     def __init__(self, streaming_response: StreamingResponse):
-        """Initialize with a streaming response."""
         self._response = streaming_response
         self.value: Optional[Message] = None
 
     def __iter__(self) -> Iterator[str]:
-        """Iterate and collect the final value."""
         for chunk in self._response:
             yield chunk
         self.value = self._response.get_final_message()
 
     async def __aiter__(self) -> AsyncIterator[str]:
-        """Async iterate and collect the final value."""
         async for chunk in self._response:
             yield chunk
         self.value = self._response.get_final_message()
