@@ -7,8 +7,10 @@ Key differences from Claudette:
 - Uses ClaudeSDKClient for tool support, query() for simple prompts
 """
 import asyncio
+import json
 import uuid
 import inspect
+from dataclasses import replace as dataclass_replace
 from typing import Any, Dict, List, Optional, Union, Callable, get_type_hints, MutableMapping, Literal
 
 from .core import (
@@ -347,6 +349,123 @@ class Chat:
 
         return ClaudeAgentOptions(**opts)
 
+    @staticmethod
+    def _msg_has_images(msg: Dict) -> bool:
+        """Check if a message dict contains image content blocks."""
+        content = msg.get('content', [])
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get('type') == 'image':
+                    return True
+        return False
+
+    def _has_images(self) -> bool:
+        """Check if any message in conversation history contains images."""
+        return any(self._msg_has_images(msg) for msg in self.h)
+
+    async def _client_messages(self, options: 'ClaudeAgentOptions', last_msg: Dict):
+        """Async generator that wraps ClaudeSDKClient lifecycle for image messages.
+
+        Uses ClaudeSDKClient (not query()) because it keeps the transport connection
+        open, which is needed for large base64 image payloads. query() closes stdin
+        immediately after sending, which can cause failures with large payloads.
+        """
+        async with ClaudeSDKClient(options=options) as client:
+            msg_dict = {"type": "user", "message": last_msg}
+            await client._transport.write(json.dumps(msg_dict) + "\n")
+            async for msg in client.receive_response():
+                yield msg
+
+    async def _call_with_images(self, options: 'ClaudeAgentOptions', prefill: str = '') -> Message:
+        """Handle SDK calls when conversation contains image content blocks.
+
+        Uses ClaudeSDKClient in streaming mode to pass structured content blocks
+        (including images) since the default --print mode only accepts plain text.
+
+        Prior conversation context (text-only messages) is included in the system prompt,
+        and the last user message (with images) is sent as a structured message.
+        """
+        # Separate prior context from the last message
+        prior_msgs = self.h[:-1]
+        last_msg = self.h[-1]
+
+        # Build prior context as text and prepend to system prompt
+        if prior_msgs:
+            prior_text = self._build_conversation_prompt_from(prior_msgs)
+            current_sp = options.system_prompt or ""
+            if isinstance(current_sp, str):
+                enhanced_sp = f"{current_sp}\n\n[Previous conversation]\n{prior_text}\n[End of previous conversation]"
+            else:
+                # For preset system prompts, append context
+                append = current_sp.get('append', '')
+                enhanced_sp = {**current_sp, 'append': f"{append}\n\n[Previous conversation]\n{prior_text}\n[End of previous conversation]"}
+            options = dataclass_replace(options, system_prompt=enhanced_sp)
+
+        if prefill:
+            # Add prefill instruction to the text content of the last message
+            content = last_msg.get('content', [])
+            if isinstance(content, list):
+                content = content + [{"type": "text", "text": f"[Start your response with: {prefill}]"}]
+                last_msg = {**last_msg, "content": content}
+
+        collected_text = []
+        final_message = None
+        total_usage = usage()
+
+        try:
+            async for msg in self._client_messages(options, last_msg):
+                if SDKResultMessage is not None and isinstance(msg, SDKResultMessage):
+                    if hasattr(msg, 'usage') and msg.usage:
+                        total_usage = _parse_usage(msg.usage)
+                    if hasattr(msg, 'total_cost_usd'):
+                        self.c._last_cost_usd = msg.total_cost_usd
+                    continue
+
+                if SDKAssistantMessage is not None and isinstance(msg, SDKAssistantMessage):
+                    if hasattr(msg, 'content'):
+                        final_message = _parse_sdk_message(msg)
+                        for block in msg.content:
+                            if hasattr(block, 'text'):
+                                collected_text.append(block.text)
+                elif hasattr(msg, 'content'):
+                    final_message = _parse_sdk_message(msg)
+                    for block in msg.content:
+                        if hasattr(block, 'text'):
+                            collected_text.append(block.text)
+
+        except Exception as e:
+            final_message = _simple_text_message(f"Error: {str(e)}")
+
+        if final_message is None:
+            final_message = _simple_text_message("".join(collected_text) if collected_text else "No response")
+
+        if total_usage.total > 0:
+            final_message.usage = total_usage
+
+        return final_message
+
+    def _build_conversation_prompt_from(self, msgs: List[Dict]) -> str:
+        """Build a text conversation prompt from a list of message dicts."""
+        parts = []
+        for msg in msgs:
+            role = msg.get('role', 'user')
+            content = msg.get('content', [])
+            if isinstance(content, str):
+                parts.append(f"{role.capitalize()}: {content}")
+            elif isinstance(content, list):
+                text_parts = []
+                for c in content:
+                    if isinstance(c, dict):
+                        if c.get('type') == 'text':
+                            text_parts.append(c.get('text', ''))
+                        elif c.get('type') == 'tool_result':
+                            text_parts.append(f"[Tool Result: {c.get('content', '')}]")
+                    elif isinstance(c, str):
+                        text_parts.append(c)
+                if text_parts:
+                    parts.append(f"{role.capitalize()}: {' '.join(text_parts)}")
+        return "\n\n".join(parts)
+
     def _build_conversation_prompt(self) -> str:
         """Build a conversation prompt from history."""
         parts = []
@@ -476,18 +595,22 @@ class Chat:
         if temp is None:
             temp = self.temp
 
-        conversation_text = self._build_conversation_prompt()
-
-        if prefill:
-            conversation_text = f"{conversation_text}\n\n[Start your response with: {prefill}]"
-
         options = self._build_options(maxthinktok=maxthinktok, stream=stream, **kw)
 
-        # Use ClaudeSDKClient if we have tools, otherwise use query()
-        if self._mcp_server:
-            final_message = await self._call_with_tools(conversation_text, options, **kw)
+        # Use streaming mode for image content (plain text mode drops image blocks)
+        if self._has_images():
+            final_message = await self._call_with_images(options, prefill=prefill)
         else:
-            final_message = await self._call_simple(conversation_text, options, **kw)
+            conversation_text = self._build_conversation_prompt()
+
+            if prefill:
+                conversation_text = f"{conversation_text}\n\n[Start your response with: {prefill}]"
+
+            # Use ClaudeSDKClient if we have tools, otherwise use query()
+            if self._mcp_server:
+                final_message = await self._call_with_tools(conversation_text, options, **kw)
+            else:
+                final_message = await self._call_simple(conversation_text, options, **kw)
 
         self.c._r(final_message, prefill)
 
